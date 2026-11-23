@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Bottom-Layer Vital-Sign Sensor Node (0~10 per Middle Pi)
 # Connects: Webcam + micro:bit (GSR, BPM, Temp) -> Streams 2-min summary to assigned Middle Pi.
-# Dynamically resolves its assigned room (MID-01..03) from Top Pi every 5s, with local fallback.
+# Dynamically resolves its assigned room (MID-01..03) from Top Pi every 5s and after sensing.
 # Automatically switches to simulated sensors if no micro:bit is connected (or with --sim).
 
 from __future__ import annotations
@@ -145,11 +145,12 @@ def sync_dynamic_route():
             MIDDLE_URL_FILE.write_text(new_url + "\n", encoding="utf-8")
         except OSError:
             pass
+        mode_label = "automatically" if mode == "auto" else mode
         if old_url:
             post_json(f"{old_url}/api/detach", {"module_id": MODULE_ID}, timeout=2.5)
-            print(f"\n[{MODULE_ID}] ROOM SWITCH ({mode}): {old_mid} -> {new_mid} ({new_url})\n")
+            print(f"\n[{MODULE_ID}] ROOM SWITCH ({mode_label}): {old_mid} -> {new_mid} ({new_url})\n")
         else:
-            print(f"[{MODULE_ID}] Assigned Room ({mode}): {new_mid} ({new_url})")
+            print(f"[{MODULE_ID}] Assigned Room ({mode_label}): {new_mid} ({new_url})")
 
 
 def start_ble_beacon():
@@ -425,6 +426,7 @@ def mean(values: list[float]) -> float:
 def finalize_session(rows: list[tuple], resp_result: dict, wall_duration_s: float):
     if not rows:
         print("  [!] No data rows recorded.")
+        sync_dynamic_route()
         return
 
     gsr_list = [r[0] for r in rows]
@@ -483,6 +485,9 @@ def finalize_session(rows: list[tuple], resp_result: dict, wall_duration_s: floa
             payload["mean_temp_c"] if payload["mean_temp_c"] is not None else "",
             "1" if sent_ok else "0",
         ])
+
+    # Re-check Bluetooth / dynamic room assignment right after finishing sensing
+    sync_dynamic_route()
 
 
 def run_capture_loop(read_line_fn, sim_mode: bool, hb_stop: threading.Event):

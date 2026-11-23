@@ -75,7 +75,7 @@ def resolve_route_locked(mod_id: str) -> dict:
         mode = entry.get("mode", "auto")
     else:
         target_mid = default_middle_id_locked()
-        mode = "default"
+        mode = "auto"
         room_assignments[mod_id] = {
             "mid_id": target_mid,
             "mode": mode,
@@ -98,7 +98,7 @@ def resolve_route_locked(mod_id: str) -> dict:
     }
 
 
-def evaluate_ble_routing_locked(mod_id: str, now: float):
+def evaluate_ble_routing_locked(mod_id: str, now: float, force_recheck: bool = False):
     """Auto-assigns mod_id to the strongest BLE room unless pinned in 'manual' mode."""
     current = room_assignments.get(mod_id, {})
     if current.get("mode") == "manual":
@@ -110,14 +110,24 @@ def evaluate_ble_routing_locked(mod_id: str, now: float):
         for mid, info in obs.items()
         if (now - info["ts"]) <= BLE_STALE_S and mid in middle_states
     }
+
     if not fresh:
+        if force_recheck:
+            default_mid = default_middle_id_locked()
+            room_assignments[mod_id] = {
+                "mid_id": default_mid,
+                "mode": "auto",
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            save_assignments_locked()
+            print(f"[{TOP_ID}] ROOM ASSIGN (AUTOMATIC - default/no BLE): {mod_id} -> {default_mid}")
         return
 
     best_mid, best_rssi = max(fresh.items(), key=lambda kv: kv[1])
     cur_mid = current.get("mid_id")
 
-    if not cur_mid or cur_mid not in fresh:
-        if cur_mid != best_mid:
+    if force_recheck or not cur_mid or cur_mid not in fresh:
+        if cur_mid != best_mid or current.get("mode") != "auto":
             room_assignments[mod_id] = {
                 "mid_id": best_mid,
                 "mode": "auto",
@@ -125,7 +135,7 @@ def evaluate_ble_routing_locked(mod_id: str, now: float):
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
             }
             save_assignments_locked()
-            print(f"[{TOP_ID}] BLE AUTO-ROUTE: {mod_id} -> {best_mid} (RSSI {best_rssi} dBm)")
+            print(f"[{TOP_ID}] ROOM ASSIGN (AUTOMATIC): {mod_id} -> {best_mid} (RSSI {best_rssi} dBm)")
         return
 
     cur_rssi = fresh[cur_mid]
@@ -138,7 +148,7 @@ def evaluate_ble_routing_locked(mod_id: str, now: float):
         }
         save_assignments_locked()
         print(
-            f"[{TOP_ID}] BLE AUTO-SWITCH: {mod_id} moved {cur_mid} ({cur_rssi} dBm) "
+            f"[{TOP_ID}] ROOM ASSIGN (AUTOMATIC): {mod_id} {cur_mid} ({cur_rssi} dBm) "
             f"-> {best_mid} ({best_rssi} dBm)"
         )
 
@@ -254,7 +264,7 @@ def render_rooms_html() -> str:
 
       const tbody = document.getElementById('rows');
       tbody.innerHTML = Array.from(mods).sort().map(mod => {
-        const cur = (data.room_assignments || {})[mod] || {mid_id: 'MID-01', mode: 'default'};
+        const cur = (data.room_assignments || {})[mod] || {mid_id: 'MID-01', mode: 'auto'};
         const btns = mids.map(m => {
           const cls = (cur.mid_id === m && cur.mode === 'manual') ? 'active' : '';
           return `<button class="${cls}" onclick="assign('${mod}','${m}','manual')">${m}</button>`;
@@ -337,11 +347,12 @@ class TopHandler(BaseHTTPRequestHandler):
                     "updated_at": datetime.now().isoformat(timespec="seconds"),
                 }
                 if mode == "auto":
-                    evaluate_ble_routing_locked(mod_id, now)
-                save_assignments_locked()
+                    evaluate_ble_routing_locked(mod_id, now, force_recheck=True)
+                else:
+                    save_assignments_locked()
+                    print(f"[{TOP_ID}] ROOM ASSIGN (MANUAL): {mod_id} -> {mid_id}")
                 route_info = resolve_route_locked(mod_id)
 
-            print(f"[{TOP_ID}] ROOM ASSIGN ({mode.upper()}): {mod_id} -> {route_info['mid_id']}")
             self._send_json(200, route_info)
             return
 

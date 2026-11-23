@@ -133,7 +133,10 @@ def ble_scanner_worker(stop_event: threading.Event):
     try:
         from bleak import BleakScanner  # type: ignore
     except ImportError:
-        return  # Optional: works without bleak via manual/API room switching
+        print(f"[{MIDDLE_ID}] BLE scanner disabled (bleak not installed).")
+        return
+
+    print(f"[{MIDDLE_ID}] BLE scanner active (bleak).")
 
     async def _scan_loop():
         while not stop_event.is_set():
