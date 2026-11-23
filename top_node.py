@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Top-Layer Raspberry Pi Coordinator (1 Top Pi <- 3 Middle Pis <- 0~10 Bottom Pis each)
-# Acts as Central Room Directory: supports Hybrid BLE RSSI Auto-Routing + Manual/API Override.
+# Acts as Central Room Directory: supports periodic BLE RSSI Auto-Routing + Manual/API Override.
 
 from __future__ import annotations
 
@@ -23,8 +23,9 @@ MASTER_CSV = OUT_DIR / "TOP_master_readings.csv"
 LATEST_JSON = OUT_DIR / "TOP_latest_state.json"
 ASSIGNMENTS_JSON = OUT_DIR / "TOP_room_assignments.json"
 
-BLE_STALE_S = 15.0          # Ignore BLE RSSI readings older than 15s
-BLE_HYSTERESIS_DBM = 6.0    # New room must be >= 6 dBm stronger than current room to auto-switch
+BLE_STALE_S = 20.0                                          # Ignore BLE RSSI readings older than 20s
+BLE_HYSTERESIS_DBM = float(os.getenv("BLE_HYSTERESIS_DBM", "3.0"))
+AUTO_CHECK_INTERVAL_S = float(os.getenv("AUTO_CHECK_INTERVAL_S", "15.0"))
 
 MASTER_HEADER = [
     "top_received_at", "middle_id", "trigger_module",
@@ -98,7 +99,12 @@ def resolve_route_locked(mod_id: str) -> dict:
     }
 
 
-def evaluate_ble_routing_locked(mod_id: str, now: float, force_recheck: bool = False):
+def evaluate_ble_routing_locked(
+    mod_id: str,
+    now: float,
+    force_recheck: bool = False,
+    source_tag: str = "BLE",
+):
     """Auto-assigns mod_id to the strongest BLE room unless pinned in 'manual' mode."""
     current = room_assignments.get(mod_id, {})
     if current.get("mode") == "manual":
@@ -120,11 +126,12 @@ def evaluate_ble_routing_locked(mod_id: str, now: float, force_recheck: bool = F
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
             }
             save_assignments_locked()
-            print(f"[{TOP_ID}] ROOM ASSIGN (AUTOMATIC - default/no BLE): {mod_id} -> {default_mid}")
+            print(f"[{TOP_ID}] ROOM ASSIGN ({source_tag} - no BLE signal yet): {mod_id} -> {default_mid}")
         return
 
     best_mid, best_rssi = max(fresh.items(), key=lambda kv: kv[1])
     cur_mid = current.get("mid_id")
+    rssi_summary = ", ".join(f"{m}:{r:.0f}dBm" for m, r in sorted(fresh.items()))
 
     if force_recheck or not cur_mid or cur_mid not in fresh:
         if cur_mid != best_mid or current.get("mode") != "auto":
@@ -135,7 +142,7 @@ def evaluate_ble_routing_locked(mod_id: str, now: float, force_recheck: bool = F
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
             }
             save_assignments_locked()
-            print(f"[{TOP_ID}] ROOM ASSIGN (AUTOMATIC): {mod_id} -> {best_mid} (RSSI {best_rssi} dBm)")
+            print(f"[{TOP_ID}] ROOM ASSIGN ({source_tag}): {mod_id} -> {best_mid} [{rssi_summary}]")
         return
 
     cur_rssi = fresh[cur_mid]
@@ -148,9 +155,22 @@ def evaluate_ble_routing_locked(mod_id: str, now: float, force_recheck: bool = F
         }
         save_assignments_locked()
         print(
-            f"[{TOP_ID}] ROOM ASSIGN (AUTOMATIC): {mod_id} {cur_mid} ({cur_rssi} dBm) "
-            f"-> {best_mid} ({best_rssi} dBm)"
+            f"[{TOP_ID}] ROOM SWITCH ({source_tag}): {mod_id} {cur_mid} -> {best_mid} [{rssi_summary}]"
         )
+
+
+def periodic_auto_route_worker(stop_event: threading.Event):
+    """Periodically re-evaluates closest Middle Pi for all nodes in AUTO mode."""
+    while not stop_event.is_set():
+        stop_event.wait(AUTO_CHECK_INTERVAL_S)
+        if stop_event.is_set():
+            break
+        now = time.time()
+        with state_lock:
+            all_mods = set(room_assignments.keys()) | set(ble_observations.keys())
+            for mod_id in sorted(all_mods):
+                if room_assignments.get(mod_id, {}).get("mode", "auto") == "auto":
+                    evaluate_ble_routing_locked(mod_id, now, force_recheck=False, source_tag="TIMER")
 
 
 def build_global_snapshot_locked() -> dict:
@@ -187,15 +207,28 @@ def build_global_snapshot_locked() -> dict:
             "bottom_nodes": pkt.get("bottom_nodes", {}),
         }
 
+    ble_live = {}
+    for mod_id, per_mid in sorted(ble_observations.items()):
+        ble_live[mod_id] = {
+            mid: {
+                "rssi": info["rssi"],
+                "age_s": round(now - info["ts"], 1),
+            }
+            for mid, info in sorted(per_mid.items())
+            if (now - info["ts"]) <= BLE_STALE_S
+        }
+
     def avg(vals: list[float]) -> float | None:
         return round(sum(vals) / len(vals), 2) if vals else None
 
     return {
         "updated_at": datetime.now().isoformat(timespec="seconds"),
         "top_id": TOP_ID,
+        "auto_check_interval_s": AUTO_CHECK_INTERVAL_S,
         "connected_middle_count": len(middle_states),
         "total_active_bottom_count": total_bottom_active,
         "room_assignments": room_assignments,
+        "ble_rssi": ble_live,
         "global_summary": {
             "mean_eda_peaks_2min": avg(all_eda),
             "mean_bpm": avg(all_bpm),
@@ -213,7 +246,7 @@ def render_rooms_html() -> str:
   <meta charset="utf-8">
   <title>Vital Cluster — Dynamic Room Router</title>
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 820px; margin: 28px auto; padding: 0 16px; background: #111827; color: #f3f4f6; }
+    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 920px; margin: 28px auto; padding: 0 16px; background: #111827; color: #f3f4f6; }
     h1 { font-size: 20px; margin-bottom: 6px; }
     p.sub { color: #9ca3af; font-size: 13px; margin-top: 0; }
     table { width: 100%; border-collapse: collapse; margin-top: 16px; background: #1f2937; border-radius: 8px; overflow: hidden; }
@@ -221,16 +254,21 @@ def render_rooms_html() -> str:
     th { background: #111827; color: #9ca3af; font-weight: 600; }
     button { background: #2563eb; color: #fff; border: none; padding: 6px 10px; border-radius: 6px; cursor: pointer; margin-right: 4px; font-size: 12px; }
     button.auto { background: #059669; }
+    button.check { background: #7c3aed; margin-left: 8px; }
     button.active { outline: 2px solid #fbbf24; font-weight: 700; }
     .badge { padding: 2px 7px; border-radius: 999px; font-size: 11px; background: #374151; }
+    .rssi { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px; color: #93c5fd; }
   </style>
 </head>
 <body>
-  <h1>Dynamic Room Router (Hybrid BLE + Manual Override)</h1>
-  <p class="sub">Click a room to pin a participant manually, or click <b>AUTO (BLE)</b> to let Bluetooth proximity route automatically.</p>
+  <h1>Dynamic Room Router (Hybrid BLE Timer + Manual Override)</h1>
+  <p class="sub">
+    Timer automatically checks closest room every <span id="interval">15</span>s when in <b>AUTO (BLE)</b> mode.
+    <button class="check" onclick="recheckAll()">Check Closest Now</button>
+  </p>
   <div id="middles"></div>
   <table>
-    <thead><tr><th>Participant (MOD)</th><th>Assigned Room</th><th>Mode</th><th>Switch Room</th></tr></thead>
+    <thead><tr><th>Participant (MOD)</th><th>Assigned Room</th><th>Mode</th><th>Live BLE Signal (Higher = Closer)</th><th>Switch Room</th></tr></thead>
     <tbody id="rows"></tbody>
   </table>
   <script>
@@ -242,9 +280,16 @@ def render_rooms_html() -> str:
       });
       refresh();
     }
+    async function recheckAll() {
+      await fetch('/api/recheck', { method: 'POST' });
+      refresh();
+    }
     async function refresh() {
       const res = await fetch('/api/status');
       const data = await res.json();
+      if (data.auto_check_interval_s) {
+        document.getElementById('interval').textContent = data.auto_check_interval_s;
+      }
       const mids = Object.keys(data.middle_nodes);
       if (!mids.includes('MID-01')) mids.push('MID-01');
       if (!mids.includes('MID-02')) mids.push('MID-02');
@@ -265,11 +310,17 @@ def render_rooms_html() -> str:
       const tbody = document.getElementById('rows');
       tbody.innerHTML = Array.from(mods).sort().map(mod => {
         const cur = (data.room_assignments || {})[mod] || {mid_id: 'MID-01', mode: 'auto'};
+        const rssiMap = (data.ble_rssi || {})[mod] || {};
+        const rssiKeys = Object.keys(rssiMap).sort();
+        const rssiText = rssiKeys.length
+          ? rssiKeys.map(k => `${k}: ${rssiMap[k].rssi} dBm`).join(' | ')
+          : 'No BLE beacon detected yet';
+
         const btns = mids.map(m => {
           const cls = (cur.mid_id === m && cur.mode === 'manual') ? 'active' : '';
           return `<button class="${cls}" onclick="assign('${mod}','${m}','manual')">${m}</button>`;
         }).join('') + `<button class="auto ${cur.mode === 'auto' ? 'active' : ''}" onclick="assign('${mod}','${cur.mid_id}','auto')">AUTO (BLE)</button>`;
-        return `<tr><td><b>${mod}</b></td><td>${cur.mid_id}</td><td><span class="badge">${cur.mode}</span></td><td>${btns}</td></tr>`;
+        return `<tr><td><b>${mod}</b></td><td>${cur.mid_id}</td><td><span class="badge">${cur.mode}</span></td><td class="rssi">${rssiText}</td><td>${btns}</td></tr>`;
       }).join('');
     }
     refresh();
@@ -330,6 +381,16 @@ class TopHandler(BaseHTTPRequestHandler):
         client_ip = self.client_address[0]
         now = time.time()
 
+        if self.path == "/api/recheck":
+            with state_lock:
+                all_mods = set(room_assignments.keys()) | set(ble_observations.keys())
+                for mod_id in sorted(all_mods):
+                    if room_assignments.get(mod_id, {}).get("mode", "auto") == "auto":
+                        evaluate_ble_routing_locked(mod_id, now, force_recheck=True, source_tag="RECHECK")
+                snapshot = build_global_snapshot_locked()
+            self._send_json(200, {"ok": True, "room_assignments": snapshot["room_assignments"]})
+            return
+
         if self.path == "/api/assign":
             mod_id = str(payload.get("mod_id", "")).strip().upper()
             mid_id = str(payload.get("mid_id", "")).strip().upper()
@@ -347,7 +408,7 @@ class TopHandler(BaseHTTPRequestHandler):
                     "updated_at": datetime.now().isoformat(timespec="seconds"),
                 }
                 if mode == "auto":
-                    evaluate_ble_routing_locked(mod_id, now, force_recheck=True)
+                    evaluate_ble_routing_locked(mod_id, now, force_recheck=True, source_tag="AUTO-BTN")
                 else:
                     save_assignments_locked()
                     print(f"[{TOP_ID}] ROOM ASSIGN (MANUAL): {mod_id} -> {mid_id}")
@@ -371,7 +432,7 @@ class TopHandler(BaseHTTPRequestHandler):
                     except (TypeError, ValueError):
                         continue
                     ble_observations.setdefault(mod_id, {})[mid_id] = {"rssi": rssi, "ts": now}
-                    evaluate_ble_routing_locked(mod_id, now)
+                    evaluate_ble_routing_locked(mod_id, now, force_recheck=False, source_tag="BLE-SCAN")
 
             self._send_json(200, {"ok": True})
             return
@@ -441,15 +502,19 @@ class TopHandler(BaseHTTPRequestHandler):
 def main():
     OUT_DIR.mkdir(exist_ok=True)
     load_assignments()
+    stop_event = threading.Event()
+    threading.Thread(target=periodic_auto_route_worker, args=(stop_event,), daemon=True).start()
+
     server = ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), TopHandler)
     print(f"[{TOP_ID}] Top Coordinator listening on 0.0.0.0:{LISTEN_PORT}")
     print(f"[{TOP_ID}] Live JSON endpoint: http://0.0.0.0:{LISTEN_PORT}/api/status")
-    print(f"[{TOP_ID}] Room Switcher UI  : http://0.0.0.0:{LISTEN_PORT}/rooms")
+    print(f"[{TOP_ID}] Room Switcher UI  : http://0.0.0.0:{LISTEN_PORT}/rooms (Auto-check every {AUTO_CHECK_INTERVAL_S:.0f}s)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nShutting down Top Node.")
     finally:
+        stop_event.set()
         server.server_close()
 
 

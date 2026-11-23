@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Bottom-Layer Vital-Sign Sensor Node (0~10 per Middle Pi)
 # Connects: Webcam + micro:bit (GSR, BPM, Temp) -> Streams 2-min summary to assigned Middle Pi.
-# Dynamically resolves its assigned room (MID-01..03) from Top Pi every 5s and after sensing.
+# Broadcasts persistent BLE beacon (MODULE_ID) for proximity routing & resolves room from Top Pi.
 # Automatically switches to simulated sensors if no micro:bit is connected (or with --sim).
 
 from __future__ import annotations
@@ -52,6 +52,7 @@ R0 = 100000.0
 route_lock = threading.Lock()
 current_mid_id: str = "UNASSIGNED"
 current_middle_url: str = ""
+_bt_proc: subprocess.Popen | None = None
 
 
 def get_top_url() -> str:
@@ -154,15 +155,57 @@ def sync_dynamic_route():
 
 
 def start_ble_beacon():
-    """Sets Bluetooth adapter alias to MODULE_ID and enables advertising if bluez tools exist."""
-    if not shutil.which("bluetoothctl"):
-        return
-    try:
-        subprocess.run(["bluetoothctl", "power", "on"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
-        subprocess.run(["bluetoothctl", "system-alias", MODULE_ID], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
-        subprocess.run(["bluetoothctl", "advertise", "on"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
-    except Exception:
-        pass
+    """Enables persistent BLE advertising with Local Name = MODULE_ID."""
+    global _bt_proc
+    if shutil.which("rfkill"):
+        try:
+            subprocess.run(["rfkill", "unblock", "bluetooth"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+        except Exception:
+            pass
+
+    if shutil.which("btmgmt"):
+        for cmd in [
+            ["btmgmt", "power", "on"],
+            ["btmgmt", "le", "on"],
+            ["btmgmt", "connectable", "on"],
+            ["btmgmt", "discov", "on"],
+            ["btmgmt", "name", MODULE_ID],
+            ["btmgmt", "advertising", "on"],
+        ]:
+            try:
+                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+            except Exception:
+                pass
+
+    # Keep a persistent bluetoothctl process alive so D-Bus LEAdvertisement1 stays registered
+    if shutil.which("bluetoothctl") and _bt_proc is None:
+        try:
+            _bt_proc = subprocess.Popen(
+                ["bluetoothctl"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            if _bt_proc.stdin:
+                _bt_proc.stdin.write(f"power on\nsystem-alias {MODULE_ID}\nadvertise on\n")
+                _bt_proc.stdin.flush()
+            print(f"[{MODULE_ID}] BLE beacon active (advertising as '{MODULE_ID}').")
+        except Exception as exc:
+            print(f"[{MODULE_ID}] Note: BLE beacon failed to start ({exc}).")
+
+
+def stop_ble_beacon():
+    global _bt_proc
+    if _bt_proc is not None:
+        try:
+            if _bt_proc.stdin:
+                _bt_proc.stdin.write("advertise off\nquit\n")
+                _bt_proc.stdin.flush()
+            _bt_proc.terminate()
+        except Exception:
+            pass
+        _bt_proc = None
 
 
 def flush_unsent_queue(middle_url: str):
@@ -571,6 +614,7 @@ def run_capture_loop(read_line_fn, sim_mode: bool, hb_stop: threading.Event):
             resp_stop_event.set()
     finally:
         hb_stop.set()
+        stop_ble_beacon()
         if f:
             f.close()
 

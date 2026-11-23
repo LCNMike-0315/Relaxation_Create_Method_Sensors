@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Middle-Layer Raspberry Pi Aggregator (3 Middle Pis: MID-01, MID-02, MID-03)
 # Receives from 0~10 dynamic Bottom Pis -> Aggregates & forwards to 1 Top Pi
-# Supports clean /api/detach on room switches and optional BLE RSSI room scanning.
+# Supports clean /api/detach on room switches and BLE RSSI room scanning.
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ TOP_URL_FILE = Path("top_url.txt")
 OUT_DIR = Path("data")
 ACTIVE_TIMEOUT_S = 40.0     # Bottom Pi removed from active list if silent > 40s
 SYNC_INTERVAL_S = 15.0      # Periodic heartbeat/roster sync to Top Pi
-BLE_SCAN_INTERVAL_S = 4.0   # BLE proximity scan cadence (if bleak is installed)
+BLE_SCAN_INTERVAL_S = 3.0   # BLE proximity scan cadence (if bleak is installed)
 
 RECEIVED_HEADER = [
     "received_at", "middle_id", "module_id", "duration_s",
@@ -137,8 +137,10 @@ def ble_scanner_worker(stop_event: threading.Event):
         return
 
     print(f"[{MIDDLE_ID}] BLE scanner active (bleak).")
+    last_log_t = 0.0
 
     async def _scan_loop():
+        nonlocal last_log_t
         while not stop_event.is_set():
             top_url = get_top_url()
             if top_url:
@@ -150,6 +152,10 @@ def ble_scanner_worker(stop_event: threading.Event):
                         if name.startswith("MOD-"):
                             readings[name] = adv.rssi
                     if readings:
+                        now = time.time()
+                        if (now - last_log_t) >= 15.0:
+                            print(f"[{MIDDLE_ID}] BLE RSSI detected: {readings}")
+                            last_log_t = now
                         post_json(
                             f"{top_url}/api/ble_scan",
                             {"middle_id": MIDDLE_ID, "readings": readings},
