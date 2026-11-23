@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Top-Layer Raspberry Pi Coordinator (1 Top Pi <- 3 Middle Pis <- 0~10 Bottom Pis each)
-# Receives aggregated & individual data from MID-01, MID-02, MID-03
+# Acts as Central Room Directory: supports Hybrid BLE RSSI Auto-Routing + Manual/API Override.
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 # --- CONFIGURATION ---
 TOP_ID = os.getenv("TOP_ID") or socket.gethostname().upper()
@@ -20,6 +21,10 @@ LISTEN_PORT = int(os.getenv("TOP_PORT", "8000"))
 OUT_DIR = Path("data")
 MASTER_CSV = OUT_DIR / "TOP_master_readings.csv"
 LATEST_JSON = OUT_DIR / "TOP_latest_state.json"
+ASSIGNMENTS_JSON = OUT_DIR / "TOP_room_assignments.json"
+
+BLE_STALE_S = 15.0          # Ignore BLE RSSI readings older than 15s
+BLE_HYSTERESIS_DBM = 6.0    # New room must be >= 6 dBm stronger than current room to auto-switch
 
 MASTER_HEADER = [
     "top_received_at", "middle_id", "trigger_module",
@@ -29,8 +34,113 @@ MASTER_HEADER = [
 ]
 
 state_lock = threading.Lock()
-# middle_states[middle_id] = {"last_seen": float, "ip": str, "packet": dict}
+# middle_states[middle_id] = {"last_seen": float, "ip": str, "port": int, "packet": dict}
 middle_states: dict[str, dict] = {}
+
+# room_assignments[mod_id] = {"mid_id": "MID-01", "mode": "manual" | "auto", "updated_at": str}
+room_assignments: dict[str, dict] = {}
+
+# ble_observations[mod_id][mid_id] = {"rssi": float, "ts": float}
+ble_observations: dict[str, dict[str, dict]] = {}
+
+
+def load_assignments():
+    if ASSIGNMENTS_JSON.exists():
+        try:
+            data = json.loads(ASSIGNMENTS_JSON.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                room_assignments.update(data)
+        except Exception:
+            pass
+
+
+def save_assignments_locked():
+    OUT_DIR.mkdir(exist_ok=True)
+    ASSIGNMENTS_JSON.write_text(json.dumps(room_assignments, indent=2), encoding="utf-8")
+
+
+def default_middle_id_locked() -> str:
+    if "MID-01" in middle_states:
+        return "MID-01"
+    if middle_states:
+        return sorted(middle_states.keys())[0]
+    return "MID-01"
+
+
+def resolve_route_locked(mod_id: str) -> dict:
+    """Returns target Middle Pi ID and URL for a given Bottom Pi."""
+    entry = room_assignments.get(mod_id)
+    if entry and entry.get("mid_id"):
+        target_mid = entry["mid_id"]
+        mode = entry.get("mode", "auto")
+    else:
+        target_mid = default_middle_id_locked()
+        mode = "default"
+        room_assignments[mod_id] = {
+            "mid_id": target_mid,
+            "mode": mode,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        save_assignments_locked()
+
+    m_info = middle_states.get(target_mid)
+    if m_info:
+        middle_url = f"http://{m_info['ip']}:{m_info.get('port', 8001)}"
+    else:
+        middle_url = ""
+
+    return {
+        "ok": True,
+        "mod_id": mod_id,
+        "mid_id": target_mid,
+        "middle_url": middle_url,
+        "mode": mode,
+    }
+
+
+def evaluate_ble_routing_locked(mod_id: str, now: float):
+    """Auto-assigns mod_id to the strongest BLE room unless pinned in 'manual' mode."""
+    current = room_assignments.get(mod_id, {})
+    if current.get("mode") == "manual":
+        return
+
+    obs = ble_observations.get(mod_id, {})
+    fresh = {
+        mid: info["rssi"]
+        for mid, info in obs.items()
+        if (now - info["ts"]) <= BLE_STALE_S and mid in middle_states
+    }
+    if not fresh:
+        return
+
+    best_mid, best_rssi = max(fresh.items(), key=lambda kv: kv[1])
+    cur_mid = current.get("mid_id")
+
+    if not cur_mid or cur_mid not in fresh:
+        if cur_mid != best_mid:
+            room_assignments[mod_id] = {
+                "mid_id": best_mid,
+                "mode": "auto",
+                "rssi": best_rssi,
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            save_assignments_locked()
+            print(f"[{TOP_ID}] BLE AUTO-ROUTE: {mod_id} -> {best_mid} (RSSI {best_rssi} dBm)")
+        return
+
+    cur_rssi = fresh[cur_mid]
+    if best_mid != cur_mid and (best_rssi - cur_rssi) >= BLE_HYSTERESIS_DBM:
+        room_assignments[mod_id] = {
+            "mid_id": best_mid,
+            "mode": "auto",
+            "rssi": best_rssi,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        save_assignments_locked()
+        print(
+            f"[{TOP_ID}] BLE AUTO-SWITCH: {mod_id} moved {cur_mid} ({cur_rssi} dBm) "
+            f"-> {best_mid} ({best_rssi} dBm)"
+        )
 
 
 def build_global_snapshot_locked() -> dict:
@@ -59,6 +169,7 @@ def build_global_snapshot_locked() -> dict:
 
         middles_out[mid] = {
             "ip": info["ip"],
+            "port": info.get("port", 8001),
             "last_seen_ago_s": round(now - info["last_seen"], 1),
             "active_bottom_count": pkt.get("active_bottom_count", 0),
             "active_module_ids": pkt.get("active_module_ids", []),
@@ -74,6 +185,7 @@ def build_global_snapshot_locked() -> dict:
         "top_id": TOP_ID,
         "connected_middle_count": len(middle_states),
         "total_active_bottom_count": total_bottom_active,
+        "room_assignments": room_assignments,
         "global_summary": {
             "mean_eda_peaks_2min": avg(all_eda),
             "mean_bpm": avg(all_bpm),
@@ -82,6 +194,79 @@ def build_global_snapshot_locked() -> dict:
         },
         "middle_nodes": middles_out,
     }
+
+
+def render_rooms_html() -> str:
+    return """<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Vital Cluster — Dynamic Room Router</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 820px; margin: 28px auto; padding: 0 16px; background: #111827; color: #f3f4f6; }
+    h1 { font-size: 20px; margin-bottom: 6px; }
+    p.sub { color: #9ca3af; font-size: 13px; margin-top: 0; }
+    table { width: 100%; border-collapse: collapse; margin-top: 16px; background: #1f2937; border-radius: 8px; overflow: hidden; }
+    th, td { padding: 10px 12px; border-bottom: 1px solid #374151; text-align: left; font-size: 14px; }
+    th { background: #111827; color: #9ca3af; font-weight: 600; }
+    button { background: #2563eb; color: #fff; border: none; padding: 6px 10px; border-radius: 6px; cursor: pointer; margin-right: 4px; font-size: 12px; }
+    button.auto { background: #059669; }
+    button.active { outline: 2px solid #fbbf24; font-weight: 700; }
+    .badge { padding: 2px 7px; border-radius: 999px; font-size: 11px; background: #374151; }
+  </style>
+</head>
+<body>
+  <h1>Dynamic Room Router (Hybrid BLE + Manual Override)</h1>
+  <p class="sub">Click a room to pin a participant manually, or click <b>AUTO (BLE)</b> to let Bluetooth proximity route automatically.</p>
+  <div id="middles"></div>
+  <table>
+    <thead><tr><th>Participant (MOD)</th><th>Assigned Room</th><th>Mode</th><th>Switch Room</th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <script>
+    async function assign(modId, midId, mode) {
+      await fetch('/api/assign', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({mod_id: modId, mid_id: midId, mode: mode})
+      });
+      refresh();
+    }
+    async function refresh() {
+      const res = await fetch('/api/status');
+      const data = await res.json();
+      const mids = Object.keys(data.middle_nodes);
+      if (!mids.includes('MID-01')) mids.push('MID-01');
+      if (!mids.includes('MID-02')) mids.push('MID-02');
+      if (!mids.includes('MID-03')) mids.push('MID-03');
+      mids.sort();
+
+      document.getElementById('middles').innerHTML = mids.map(m => {
+        const info = data.middle_nodes[m];
+        return `<span class="badge">${m}: ${info ? info.ip + ' (' + info.active_bottom_count + ' active)' : 'offline'}</span> `;
+      }).join('');
+
+      const mods = new Set(Object.keys(data.room_assignments || {}));
+      for (const m of Object.values(data.middle_nodes)) {
+        (m.active_module_ids || []).forEach(id => mods.add(id));
+      }
+      if (mods.size === 0) { mods.add('MOD-01'); mods.add('MOD-02'); }
+
+      const tbody = document.getElementById('rows');
+      tbody.innerHTML = Array.from(mods).sort().map(mod => {
+        const cur = (data.room_assignments || {})[mod] || {mid_id: 'MID-01', mode: 'default'};
+        const btns = mids.map(m => {
+          const cls = (cur.mid_id === m && cur.mode === 'manual') ? 'active' : '';
+          return `<button class="${cls}" onclick="assign('${mod}','${m}','manual')">${m}</button>`;
+        }).join('') + `<button class="auto ${cur.mode === 'auto' ? 'active' : ''}" onclick="assign('${mod}','${cur.mid_id}','auto')">AUTO (BLE)</button>`;
+        return `<tr><td><b>${mod}</b></td><td>${cur.mid_id}</td><td><span class="badge">${cur.mode}</span></td><td>${btns}</td></tr>`;
+      }).join('');
+    }
+    refresh();
+    setInterval(refresh, 3000);
+  </script>
+</body>
+</html>"""
 
 
 class TopHandler(BaseHTTPRequestHandler):
@@ -96,47 +281,115 @@ class TopHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def _send_html(self, code: int, html: str):
+        raw = html.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
     def do_GET(self):
-        if self.path in ("/", "/api/status"):
+        parsed = urlparse(self.path)
+        if parsed.path in ("/", "/api/status"):
             with state_lock:
                 snapshot = build_global_snapshot_locked()
             self._send_json(200, snapshot)
+        elif parsed.path == "/rooms":
+            self._send_html(200, render_rooms_html())
+        elif parsed.path == "/api/route":
+            qs = parse_qs(parsed.query)
+            mod_id = str(qs.get("mod_id", [""])[0]).strip().upper()
+            if not mod_id:
+                self._send_json(400, {"error": "Missing mod_id query param"})
+                return
+            with state_lock:
+                route_info = resolve_route_locked(mod_id)
+            self._send_json(200, route_info)
         else:
             self._send_json(404, {"error": "Not found"})
 
     def do_POST(self):
-        if self.path != "/api/middle":
-            self._send_json(404, {"error": "Not found"})
-            return
-
         length = int(self.headers.get("Content-Length", "0"))
         try:
-            packet = json.loads(self.rfile.read(length).decode("utf-8"))
+            payload = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else {}
         except json.JSONDecodeError:
             self._send_json(400, {"error": "Invalid JSON"})
             return
 
-        mid = str(packet.get("middle_id", "")).strip().upper()
+        client_ip = self.client_address[0]
+        now = time.time()
+
+        if self.path == "/api/assign":
+            mod_id = str(payload.get("mod_id", "")).strip().upper()
+            mid_id = str(payload.get("mid_id", "")).strip().upper()
+            mode = str(payload.get("mode", "manual")).strip().lower()
+            if not mod_id or not mid_id:
+                self._send_json(400, {"error": "Provide mod_id and mid_id"})
+                return
+            if mode not in ("manual", "auto"):
+                mode = "manual"
+
+            with state_lock:
+                room_assignments[mod_id] = {
+                    "mid_id": mid_id,
+                    "mode": mode,
+                    "updated_at": datetime.now().isoformat(timespec="seconds"),
+                }
+                if mode == "auto":
+                    evaluate_ble_routing_locked(mod_id, now)
+                save_assignments_locked()
+                route_info = resolve_route_locked(mod_id)
+
+            print(f"[{TOP_ID}] ROOM ASSIGN ({mode.upper()}): {mod_id} -> {route_info['mid_id']}")
+            self._send_json(200, route_info)
+            return
+
+        if self.path == "/api/ble_scan":
+            mid_id = str(payload.get("middle_id", "")).strip().upper()
+            readings = payload.get("readings", {})  # {"MOD-01": -58, ...}
+            if not mid_id or not isinstance(readings, dict):
+                self._send_json(400, {"error": "Invalid ble_scan payload"})
+                return
+
+            with state_lock:
+                for mod_raw, rssi_val in readings.items():
+                    mod_id = str(mod_raw).strip().upper()
+                    try:
+                        rssi = float(rssi_val)
+                    except (TypeError, ValueError):
+                        continue
+                    ble_observations.setdefault(mod_id, {})[mid_id] = {"rssi": rssi, "ts": now}
+                    evaluate_ble_routing_locked(mod_id, now)
+
+            self._send_json(200, {"ok": True})
+            return
+
+        if self.path != "/api/middle":
+            self._send_json(404, {"error": "Not found"})
+            return
+
+        mid = str(payload.get("middle_id", "")).strip().upper()
         if not mid:
             self._send_json(400, {"error": "Missing middle_id"})
             return
 
-        client_ip = self.client_address[0]
-        now = time.time()
-        event_type = packet.get("event", "unknown")
+        event_type = payload.get("event", "unknown")
+        listen_port = int(payload.get("listen_port", 8001))
 
         with state_lock:
             is_new = mid not in middle_states
             middle_states[mid] = {
                 "last_seen": now,
                 "ip": client_ip,
-                "packet": packet,
+                "port": listen_port,
+                "packet": payload,
             }
             snapshot = build_global_snapshot_locked()
             LATEST_JSON.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
 
             if event_type == "reading":
-                gs = packet.get("group_summary", {})
+                gs = payload.get("group_summary", {})
                 write_header = not MASTER_CSV.exists()
                 with open(MASTER_CSV, "a", newline="") as mf:
                     mw = csv.writer(mf)
@@ -145,22 +398,22 @@ class TopHandler(BaseHTTPRequestHandler):
                     mw.writerow([
                         datetime.now().isoformat(timespec="seconds"),
                         mid,
-                        packet.get("trigger_module", ""),
-                        packet.get("active_bottom_count", 0),
-                        packet.get("reporting_bottom_count", 0),
+                        payload.get("trigger_module", ""),
+                        payload.get("active_bottom_count", 0),
+                        payload.get("reporting_bottom_count", 0),
                         gs.get("mean_eda_peaks_2min", ""),
                         gs.get("mean_bpm", ""),
                         gs.get("mean_resp_rate_min", ""),
                         gs.get("mean_temp_c", ""),
-                        json.dumps(packet),
+                        json.dumps(payload),
                     ])
 
         if is_new:
-            print(f"[{TOP_ID}] Middle Pi connected: {mid} ({client_ip})")
+            print(f"[{TOP_ID}] Middle Pi connected: {mid} ({client_ip}:{listen_port})")
 
         if event_type == "reading":
             print("\n" + "=" * 60)
-            print(f"[{TOP_ID}] UPDATE from {mid} (trigger: {packet.get('trigger_module')})")
+            print(f"[{TOP_ID}] UPDATE from {mid} (trigger: {payload.get('trigger_module')})")
             for m_key, m_val in snapshot["middle_nodes"].items():
                 gs = m_val["group_summary"]
                 print(
@@ -176,9 +429,11 @@ class TopHandler(BaseHTTPRequestHandler):
 
 def main():
     OUT_DIR.mkdir(exist_ok=True)
+    load_assignments()
     server = ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), TopHandler)
     print(f"[{TOP_ID}] Top Coordinator listening on 0.0.0.0:{LISTEN_PORT}")
     print(f"[{TOP_ID}] Live JSON endpoint: http://0.0.0.0:{LISTEN_PORT}/api/status")
+    print(f"[{TOP_ID}] Room Switcher UI  : http://0.0.0.0:{LISTEN_PORT}/rooms")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # Middle-Layer Raspberry Pi Aggregator (3 Middle Pis: MID-01, MID-02, MID-03)
 # Receives from 0~10 dynamic Bottom Pis -> Aggregates & forwards to 1 Top Pi
+# Supports clean /api/detach on room switches and optional BLE RSSI room scanning.
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import json
 import os
@@ -23,6 +25,7 @@ TOP_URL_FILE = Path("top_url.txt")
 OUT_DIR = Path("data")
 ACTIVE_TIMEOUT_S = 40.0     # Bottom Pi removed from active list if silent > 40s
 SYNC_INTERVAL_S = 15.0      # Periodic heartbeat/roster sync to Top Pi
+BLE_SCAN_INTERVAL_S = 4.0   # BLE proximity scan cadence (if bleak is installed)
 
 RECEIVED_HEADER = [
     "received_at", "middle_id", "module_id", "duration_s",
@@ -87,6 +90,7 @@ def build_group_packet_locked(event_type: str, trigger_module: str | None = None
     return {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "middle_id": MIDDLE_ID,
+        "listen_port": LISTEN_PORT,
         "event": event_type,
         "trigger_module": trigger_module,
         "active_bottom_count": len(active_nodes),
@@ -122,6 +126,40 @@ def periodic_top_sync(stop_event: threading.Event):
             packet = build_group_packet_locked(event_type="heartbeat")
         forward_to_top(packet)
         stop_event.wait(SYNC_INTERVAL_S)
+
+
+def ble_scanner_worker(stop_event: threading.Event):
+    """Scans nearby MOD-XX BLE advertisements and sends RSSI readings to Top Pi."""
+    try:
+        from bleak import BleakScanner  # type: ignore
+    except ImportError:
+        return  # Optional: works without bleak via manual/API room switching
+
+    async def _scan_loop():
+        while not stop_event.is_set():
+            top_url = get_top_url()
+            if top_url:
+                try:
+                    devices = await BleakScanner.discover(timeout=2.5, return_adv=True)
+                    readings = {}
+                    for _addr, (dev, adv) in devices.items():
+                        name = (adv.local_name or dev.name or "").strip().upper()
+                        if name.startswith("MOD-"):
+                            readings[name] = adv.rssi
+                    if readings:
+                        post_json(
+                            f"{top_url}/api/ble_scan",
+                            {"middle_id": MIDDLE_ID, "readings": readings},
+                            timeout=2.5,
+                        )
+                except Exception:
+                    pass
+            await asyncio.sleep(BLE_SCAN_INTERVAL_S)
+
+    try:
+        asyncio.run(_scan_loop())
+    except Exception:
+        pass
 
 
 class MiddleHandler(BaseHTTPRequestHandler):
@@ -174,6 +212,25 @@ class MiddleHandler(BaseHTTPRequestHandler):
                 print(f"[{MIDDLE_ID}] Bottom node attached: {mod_id} ({client_ip}) | Active count: {count}")
             self._send_json(200, {"ok": True, "middle_id": MIDDLE_ID, "active_count": count})
 
+        elif self.path == "/api/detach":
+            mod_id = str(data.get("module_id", "")).strip().upper()
+            if not mod_id:
+                self._send_json(400, {"error": "Missing module_id"})
+                return
+
+            packet = None
+            with state_lock:
+                existed = mod_id in active_nodes
+                if existed:
+                    del active_nodes[mod_id]
+                    packet = build_group_packet_locked(event_type="detach", trigger_module=mod_id)
+                count = len(active_nodes)
+
+            if existed and packet is not None:
+                print(f"[{MIDDLE_ID}] Bottom node detached (room switch): {mod_id} | Active count: {count}")
+                forward_to_top(packet)
+            self._send_json(200, {"ok": True, "middle_id": MIDDLE_ID, "active_count": count})
+
         elif self.path == "/api/bottom":
             mod_id = str(data.get("module_id", "")).strip().upper()
             if not mod_id:
@@ -188,7 +245,6 @@ class MiddleHandler(BaseHTTPRequestHandler):
                     active_nodes[mod_id]["ip"] = client_ip
                     active_nodes[mod_id]["latest_reading"] = data
 
-                # Log individual packet locally
                 csv_path = OUT_DIR / f"{MIDDLE_ID}_received.csv"
                 write_header = not csv_path.exists()
                 with open(csv_path, "a", newline="") as cf:
@@ -225,8 +281,8 @@ class MiddleHandler(BaseHTTPRequestHandler):
 def main():
     OUT_DIR.mkdir(exist_ok=True)
     stop_event = threading.Event()
-    sync_thread = threading.Thread(target=periodic_top_sync, args=(stop_event,), daemon=True)
-    sync_thread.start()
+    threading.Thread(target=periodic_top_sync, args=(stop_event,), daemon=True).start()
+    threading.Thread(target=ble_scanner_worker, args=(stop_event,), daemon=True).start()
 
     server = ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), MiddleHandler)
     print(f"[{MIDDLE_ID}] Listening on 0.0.0.0:{LISTEN_PORT}")
