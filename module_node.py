@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
-# Ubuntu Raspberry Pi Vital-Sign Module Coordinator
-# Connects: Webcam + micro:bit (GSR, BPM, Temp) -> Outputs 2-min summary
+# Bottom-Layer Vital-Sign Sensor Node (0~10 per Middle Pi)
+# Connects: Webcam + micro:bit (GSR, BPM, Temp) -> Streams 2-min summary to Middle Pi
+
+from __future__ import annotations
 
 import csv
+import json
 import math
 import os
 import socket
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -17,21 +22,89 @@ import serial
 from serial.tools import list_ports
 
 # --- CONFIGURATION ---
-# Reads MODULE_ID from environment variable, or defaults to the Pi's hostname (e.g. MOD-01)
 MODULE_ID = os.getenv("MODULE_ID") or socket.gethostname().upper()
 CAMERA_INDEX = int(os.getenv("CAMERA_INDEX", "0"))
 BAUD = 115200
 OUT_DIR = Path("data")
+MIDDLE_URL_FILE = Path("middle_url.txt")   # Edit this file anytime to switch Middle Pi dynamically
+QUEUE_FILE = OUT_DIR / f"{MODULE_ID}_unsent.jsonl"
+HEARTBEAT_INTERVAL_S = 10.0
 
 RAW_HEADER = ["pi_time", "mb_ms", "gsr", "bpm", "temp_raw", "temp_c"]
 SUMMARY_HEADER = [
     "timestamp", "module_id", "duration_s",
-    "eda_peaks_2min", "mean_bpm", "resp_rate_min", "mean_temp_c"
+    "eda_peaks_2min", "mean_bpm", "resp_rate_min", "mean_temp_c", "sent_to_middle"
 ]
 
 # Grove Temperature Sensor v1.2 (100k NTC thermistor, B=4250)
 B_VALUE = 4250.0
 R0 = 100000.0
+
+
+def get_middle_url() -> str:
+    """Reads target Middle Pi URL dynamically so this node can be reassigned without restarting."""
+    env_url = os.getenv("MIDDLE_URL", "").strip()
+    if env_url:
+        return env_url.rstrip("/")
+    if MIDDLE_URL_FILE.exists():
+        text = MIDDLE_URL_FILE.read_text(encoding="utf-8").strip()
+        if text:
+            return text.rstrip("/")
+    return ""
+
+
+def post_json(url: str, payload: dict, timeout: float = 4.0) -> bool:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return 200 <= resp.status < 300
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return False
+
+
+def flush_unsent_queue(middle_url: str):
+    if not middle_url or not QUEUE_FILE.exists():
+        return
+    lines = QUEUE_FILE.read_text(encoding="utf-8").splitlines()
+    if not lines:
+        return
+
+    remaining = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not post_json(f"{middle_url}/api/bottom", payload):
+            remaining.append(line)
+
+    if remaining:
+        QUEUE_FILE.write_text("\n".join(remaining) + "\n", encoding="utf-8")
+    else:
+        QUEUE_FILE.unlink(missing_ok=True)
+
+
+def heartbeat_worker(stop_event: threading.Event):
+    """Registers this bottom Pi with its assigned Middle Pi every 10 seconds."""
+    while not stop_event.is_set():
+        middle_url = get_middle_url()
+        if middle_url:
+            payload = {
+                "module_id": MODULE_ID,
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+            }
+            ok = post_json(f"{middle_url}/api/heartbeat", payload, timeout=3.0)
+            if ok:
+                flush_unsent_queue(middle_url)
+        stop_event.wait(HEARTBEAT_INTERVAL_S)
 
 
 def raw_to_celsius(adc_val: int) -> float:
@@ -43,11 +116,6 @@ def raw_to_celsius(adc_val: int) -> float:
 
 
 def count_eda_peaks(gsr_values: list[int], fs: float = 5.0, min_prominence: float = 1.2) -> int:
-    """
-    Counts phasic Skin Conductance Responses (SCR) over the 2-minute window.
-    Uses a fixed prominence threshold and detects bidirectional phasic deflections
-    relative to a 10s rolling baseline.
-    """
     if len(gsr_values) < int(fs * 5):
         return 0
 
@@ -80,11 +148,6 @@ def count_eda_peaks(gsr_values: list[int], fs: float = 5.0, min_prominence: floa
 
 
 def run_respiration_tracker(stop_event: threading.Event, result_container: dict):
-    """
-    Uses V4L2 webcam capture and rising-edge breath cycle detection (with a 1.5s cooldown
-    so individual frames within the same breath are not counted multiple times).
-    Outputs integer breaths/min.
-    """
     cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_V4L2)
     if not cap.isOpened():
         cap = cv2.VideoCapture(CAMERA_INDEX)
@@ -138,7 +201,7 @@ def run_respiration_tracker(stop_event: threading.Event, result_container: dict)
 
 def find_port() -> str | None:
     for p in list_ports.comports():
-        if p.vid == 0x0D28:  # micro:bit DAPLink
+        if p.vid == 0x0D28:
             return p.device
     return None
 
@@ -161,6 +224,25 @@ def finalize_session(rows: list[tuple], resp_result: dict, wall_duration_s: floa
     avg_bpm = mean(bpm_list)
     resp_rate = int(resp_result.get("resp_rate", 0))
     avg_temp_c = mean(temp_c_list)
+    ts_iso = datetime.now().isoformat(timespec="seconds")
+
+    payload = {
+        "timestamp": ts_iso,
+        "module_id": MODULE_ID,
+        "duration_s": round(wall_duration_s, 1),
+        "eda_peaks_2min": eda_2min,
+        "mean_bpm": round(avg_bpm, 1) if not math.isnan(avg_bpm) else None,
+        "resp_rate_min": resp_rate,
+        "mean_temp_c": round(avg_temp_c, 2) if not math.isnan(avg_temp_c) else None,
+    }
+
+    middle_url = get_middle_url()
+    sent_ok = False
+    if middle_url:
+        sent_ok = post_json(f"{middle_url}/api/bottom", payload)
+        if not sent_ok:
+            with open(QUEUE_FILE, "a", encoding="utf-8") as qf:
+                qf.write(json.dumps(payload) + "\n")
 
     print("\n" + "=" * 52)
     print(f"MODULE {MODULE_ID} — 2-MIN RESULT ({wall_duration_s:.1f}s)")
@@ -168,6 +250,7 @@ def finalize_session(rows: list[tuple], resp_result: dict, wall_duration_s: floa
     print(f"  2. Heart Rate (BPM)    : {avg_bpm:.1f}")
     print(f"  3. Respiration Rate    : {resp_rate}")
     print(f"  4. Avg Temperature     : {avg_temp_c:.2f} °C")
+    print(f"  -> Middle Pi ({middle_url or 'UNSET'}): {'SENT' if sent_ok else 'QUEUED/LOCAL'}")
     print("=" * 52 + "\n")
 
     summary_path = OUT_DIR / f"{MODULE_ID}_summary.csv"
@@ -177,13 +260,14 @@ def finalize_session(rows: list[tuple], resp_result: dict, wall_duration_s: floa
         if write_header:
             sw.writerow(SUMMARY_HEADER)
         sw.writerow([
-            datetime.now().isoformat(timespec="seconds"),
+            ts_iso,
             MODULE_ID,
             round(wall_duration_s, 1),
             eda_2min,
-            round(avg_bpm, 1) if not math.isnan(avg_bpm) else "",
+            payload["mean_bpm"] if payload["mean_bpm"] is not None else "",
             resp_rate,
-            round(avg_temp_c, 2) if not math.isnan(avg_temp_c) else "",
+            payload["mean_temp_c"] if payload["mean_temp_c"] is not None else "",
+            "1" if sent_ok else "0",
         ])
 
 
@@ -193,7 +277,12 @@ def main():
         sys.exit("micro:bit not found. Check `ls /dev/ttyACM*` or USB cable.")
 
     OUT_DIR.mkdir(exist_ok=True)
+    hb_stop = threading.Event()
+    hb_thread = threading.Thread(target=heartbeat_worker, args=(hb_stop,), daemon=True)
+    hb_thread.start()
+
     print(f"[{MODULE_ID}] Connected to {port} @ {BAUD} baud.")
+    print(f"[{MODULE_ID}] Target Middle Pi: {get_middle_url() or 'Not configured (set middle_url.txt)'}")
     print("Press Button A on the micro:bit to start a 2-minute capture...")
 
     f = writer = None
@@ -268,9 +357,11 @@ def main():
 
         except KeyboardInterrupt:
             print("\nExiting.")
+            hb_stop.set()
             if resp_stop_event:
                 resp_stop_event.set()
         finally:
+            hb_stop.set()
             if f:
                 f.close()
 
