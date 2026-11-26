@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Bottom-Layer Vital-Sign Sensor Node (0~10 per Middle Pi)
 # Connects: Webcam + micro:bit (GSR, BPM, Temp) -> Computes personal baseline Z-scores & adaptability
-# -> Streams 2-min summary & metrics to assigned Middle Pi.
+# -> Streams 2-min summary, live recording status, & metrics to assigned Middle Pi.
 # Broadcasts persistent BLE beacon (MODULE_ID) for proximity routing & resolves room from Top Pi.
 # Automatically switches to simulated sensors if no micro:bit is connected (or with --sim).
 
@@ -43,7 +43,7 @@ HISTORY_FILE = OUT_DIR / f"{MODULE_ID}_history.json"
 HEARTBEAT_INTERVAL_S = 5.0
 HISTORY_MAX_LEN = 50
 
-# Fallback baseline stats when personal history < 5 sessions (matches SPA_final_v9.ipynb)
+# Fallback baseline stats when personal history < 5 sessions
 DEFAULT_BASELINE_MEAN = [20.48, 77.74, 20.71, 36.0]
 DEFAULT_BASELINE_STD = [6.02, 23.48, 5.70, 1.0]
 
@@ -67,6 +67,26 @@ _bt_proc: subprocess.Popen | None = None
 metrics_lock = threading.Lock()
 history_buffer: deque[dict] = deque(maxlen=HISTORY_MAX_LEN)
 latest_payload_cache: dict | None = None
+
+capture_lock = threading.Lock()
+is_recording: bool = False
+capture_start_wall: float = 0.0
+is_sim_mode: bool = False
+
+
+def set_capture_state(recording: bool, sim_mode: bool | None = None):
+    global is_recording, capture_start_wall, is_sim_mode
+    with capture_lock:
+        is_recording = recording
+        capture_start_wall = time.time() if recording else 0.0
+        if sim_mode is not None:
+            is_sim_mode = sim_mode
+
+
+def get_capture_state() -> tuple[bool, float, bool]:
+    with capture_lock:
+        elapsed = round(time.time() - capture_start_wall, 1) if (is_recording and capture_start_wall > 0) else 0.0
+        return is_recording, elapsed, is_sim_mode
 
 
 # --- PURE-PYTHON STATISTICAL HELPERS (No numpy/scipy required) ---
@@ -137,11 +157,6 @@ def compute_personal_metrics(
     avg_temp_c: float,
     ts_iso: str,
 ) -> tuple[list[float], dict]:
-    """
-    Replicates cal() and calculate_adaptability_score() from SPA_final_v9.ipynb:
-    - Uses 25th percentile baseline & std when history >= 5 points.
-    - Computes slope + delta adaptability score across [E, H, R, BodyTemp].
-    """
     clean_vitals = [
         float(eda_2min) if not math.isnan(eda_2min) else DEFAULT_BASELINE_MEAN[0],
         float(avg_bpm) if not math.isnan(avg_bpm) else DEFAULT_BASELINE_MEAN[1],
@@ -310,8 +325,8 @@ def start_ble_beacon():
             ["btmgmt", "le", "on"],
             ["btmgmt", "connectable", "on"],
             ["btmgmt", "discov", "on"],
+            ["btmgmt", "advertising", "off"],
             ["btmgmt", "name", MODULE_ID],
-            ["btmgmt", "advertising", "on"],
         ]:
             try:
                 subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
@@ -328,7 +343,10 @@ def start_ble_beacon():
                 text=True,
             )
             if _bt_proc.stdin:
-                _bt_proc.stdin.write(f"power on\nsystem-alias {MODULE_ID}\nadvertise on\n")
+                time.sleep(1.0)
+                _bt_proc.stdin.write(
+                    f"power on\nsystem-alias {MODULE_ID}\ndiscoverable-timeout 0\ndiscoverable on\nadvertise on\n"
+                )
                 _bt_proc.stdin.flush()
             print(f"[{MODULE_ID}] BLE beacon active (advertising as '{MODULE_ID}').")
         except Exception as exc:
@@ -372,24 +390,38 @@ def flush_unsent_queue(middle_url: str):
         QUEUE_FILE.unlink(missing_ok=True)
 
 
+def send_heartbeat_once():
+    mid_id, middle_url = get_active_route()
+    if not middle_url:
+        return
+    with metrics_lock:
+        cached = dict(latest_payload_cache) if latest_payload_cache else None
+    if cached is not None:
+        cached["assigned_room"] = mid_id
+
+    rec_active, rec_elapsed, sim_flag = get_capture_state()
+    payload = {
+        "module_id": MODULE_ID,
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "is_recording": rec_active,
+        "recording_elapsed_s": rec_elapsed,
+        "sim_mode": sim_flag,
+        "latest_reading": cached,
+    }
+    ok = post_json(f"{middle_url}/api/heartbeat", payload, timeout=3.0)
+    if ok:
+        flush_unsent_queue(middle_url)
+
+
+def trigger_immediate_heartbeat():
+    threading.Thread(target=send_heartbeat_once, daemon=True).start()
+
+
 def heartbeat_worker(stop_event: threading.Event):
-    """Syncs room assignment from Top Pi and registers heartbeat (with latest metrics) on Middle Pi."""
+    """Syncs room assignment from Top Pi and registers heartbeat (with live capture state) on Middle Pi."""
     while not stop_event.is_set():
         sync_dynamic_route()
-        mid_id, middle_url = get_active_route()
-        if middle_url:
-            with metrics_lock:
-                cached = dict(latest_payload_cache) if latest_payload_cache else None
-            if cached is not None:
-                cached["assigned_room"] = mid_id
-            payload = {
-                "module_id": MODULE_ID,
-                "timestamp": datetime.now().isoformat(timespec="seconds"),
-                "latest_reading": cached,
-            }
-            ok = post_json(f"{middle_url}/api/heartbeat", payload, timeout=3.0)
-            if ok:
-                flush_unsent_queue(middle_url)
+        send_heartbeat_once()
         stop_event.wait(HEARTBEAT_INTERVAL_S)
 
 
@@ -710,6 +742,8 @@ def run_capture_loop(read_line_fn, sim_mode: bool, hb_stop: threading.Event):
     resp_thread = None
     resp_result = {}
 
+    set_capture_state(False, sim_mode=sim_mode)
+
     try:
         while True:
             line = read_line_fn()
@@ -727,6 +761,9 @@ def run_capture_loop(read_line_fn, sim_mode: bool, hb_stop: threading.Event):
                 writer.writerow(RAW_HEADER)
                 rows = []
                 session_start_wall = time.time()
+
+                set_capture_state(True, sim_mode=sim_mode)
+                trigger_immediate_heartbeat()
 
                 resp_result = {"resp_rate": 0}
                 resp_stop_event = threading.Event()
@@ -748,6 +785,8 @@ def run_capture_loop(read_line_fn, sim_mode: bool, hb_stop: threading.Event):
                     f = writer = None
 
                 wall_duration_s = time.time() - session_start_wall if session_start_wall > 0 else 120.0
+                set_capture_state(False, sim_mode=sim_mode)
+                trigger_immediate_heartbeat()
 
                 if resp_stop_event and resp_thread:
                     resp_stop_event.set()
@@ -782,6 +821,7 @@ def run_capture_loop(read_line_fn, sim_mode: bool, hb_stop: threading.Event):
         if resp_stop_event:
             resp_stop_event.set()
     finally:
+        set_capture_state(False, sim_mode=sim_mode)
         hb_stop.set()
         stop_ble_beacon()
         if f:

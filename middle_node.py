@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 # Middle-Layer Raspberry Pi Aggregator (3 Middle Pis: MID-01, MID-02, MID-03)
 # Receives from 0~10 dynamic Bottom Pis -> Computes Room Context Vectors, Cosine Similarities,
-# Conflict Detection, and Room Device/HVAC Controls -> Forwards to Top Pi.
-# Supports clean /api/detach on room switches and BLE RSSI room scanning.
+# Conflict Detection, and Room Device/HVAC Controls -> Forwards to Top Pi immediately on state changes.
 
 from __future__ import annotations
 
@@ -29,7 +28,7 @@ ACTIVE_TIMEOUT_S = 40.0     # Bottom Pi removed from active list if silent > 40s
 SYNC_INTERVAL_S = 15.0      # Periodic heartbeat/roster sync to Top Pi
 BLE_SCAN_INTERVAL_S = 3.0   # BLE proximity scan cadence (if bleak is installed)
 
-# --- CONTEXT & ENVIRONMENTAL CONTROL PARAMETERS (from SPA_final_v9.ipynb) ---
+# --- CONTEXT & ENVIRONMENTAL CONTROL PARAMETERS ---
 INDICATOR_WEIGHTS = [0.4, 0.3, 0.2, 0.1]
 COS_SIM_CONFLICT_THRESHOLD = 0.95
 EMOTION_CONTROL_THRESHOLD = 0.8
@@ -46,7 +45,7 @@ RECEIVED_HEADER = [
 ]
 
 state_lock = threading.Lock()
-# active_nodes[module_id] = {"last_seen": float, "ip": str, "latest_reading": dict | None}
+# active_nodes[module_id] = {"last_seen": float, "ip": str, "is_recording": bool, "recording_elapsed_s": float, "sim_mode": bool, "latest_reading": dict | None}
 active_nodes: dict[str, dict] = {}
 
 
@@ -73,7 +72,6 @@ def cosine_similarity(v1: list[float], v2: list[float]) -> float:
 
 
 def control_room_devices(state_vector: list[float], current_temp_c: float) -> dict:
-    """Determines actuator emotion setting & AC target temperature."""
     emo_vec = state_vector[:3]
     max_emo = max(emo_vec) if emo_vec else 0.0
     dom_idx = emo_vec.index(max_emo) if emo_vec else 0
@@ -91,11 +89,6 @@ def control_room_devices(state_vector: list[float], current_temp_c: float) -> di
 
 
 def compute_room_context_locked(rm_temp_c: float) -> dict:
-    """
-    Computes room context vectors across 3 strategies (Equality, Equality With Weight, Fairness),
-    cosine similarities against the group sum vector, conflict detection (< 0.95),
-    and room device/HVAC commands without numpy/scipy.
-    """
     ids_with_vecs = []
     norm_by_id: dict[str, list[float]] = {}
     score_by_id: dict[str, float] = {}
@@ -134,7 +127,6 @@ def compute_room_context_locked(rm_temp_c: float) -> dict:
 
     n = len(ids_with_vecs)
 
-    # 1. Priorities for each strategy
     pri_equality = [1.0] * n
 
     total_score = sum(score_by_id[pid] for pid in ids_with_vecs)
@@ -152,7 +144,6 @@ def compute_room_context_locked(rm_temp_c: float) -> dict:
         "Fairness": pri_fairness,
     }
 
-    # 2. Diagonal extraction equivalent: state_vec[j] = weights[j] * sum_i(pri[i] * I[i][j])
     strategy_vectors: dict[str, list[float]] = {}
     for strat_name, pris in strategy_pri_map.items():
         vec = []
@@ -161,7 +152,6 @@ def compute_room_context_locked(rm_temp_c: float) -> dict:
             vec.append(round(INDICATOR_WEIGHTS[j] * weighted_sum, 4))
         strategy_vectors[strat_name] = vec
 
-    # 3. Cosine similarity against 3-emotion simple sum vector
     group_emo_sum = [
         sum(norm_by_id[pid][j] for pid in ids_with_vecs)
         for j in range(3)
@@ -175,7 +165,6 @@ def compute_room_context_locked(rm_temp_c: float) -> dict:
         if sum(group_emo_sum) > 0 and sim < COS_SIM_CONFLICT_THRESHOLD:
             conflict_detected = True
 
-    # 4. Room device & AC control driven by Equality With Weight context vector
     room_control = control_room_devices(strategy_vectors["Equality With Weight"], rm_temp_c)
 
     priority_weights = {
@@ -246,6 +235,11 @@ def build_group_packet_locked(event_type: str, trigger_module: str | None = None
         if info["latest_reading"] is not None
     ]
 
+    recording_ids = sorted(
+        mid for mid, info in active_nodes.items()
+        if info.get("is_recording", False)
+    )
+
     def avg_field(key: str) -> float | None:
         vals = [r[key] for r in readings if r.get(key) is not None]
         return round(sum(vals) / len(vals), 2) if vals else None
@@ -260,6 +254,7 @@ def build_group_packet_locked(event_type: str, trigger_module: str | None = None
         "active_bottom_count": len(active_nodes),
         "reporting_bottom_count": len(readings),
         "active_module_ids": sorted(active_nodes.keys()),
+        "recording_module_ids": recording_ids,
         "group_summary": {
             "mean_eda_peaks_2min": avg_field("eda_peaks_2min"),
             "mean_bpm": avg_field("mean_bpm"),
@@ -271,6 +266,9 @@ def build_group_packet_locked(event_type: str, trigger_module: str | None = None
             mid: {
                 "ip": info["ip"],
                 "last_seen_ago_s": round(now - info["last_seen"], 1),
+                "is_recording": bool(info.get("is_recording", False)),
+                "recording_elapsed_s": round(float(info.get("recording_elapsed_s", 0.0)), 1),
+                "sim_mode": bool(info.get("sim_mode", False)),
                 "latest_reading": info["latest_reading"],
             }
             for mid, info in sorted(active_nodes.items())
@@ -374,23 +372,47 @@ class MiddleHandler(BaseHTTPRequestHandler):
                 return
 
             hb_reading = data.get("latest_reading")
+            rec_active = bool(data.get("is_recording", False))
+            rec_elapsed = float(data.get("recording_elapsed_s", 0.0))
+            sim_flag = bool(data.get("sim_mode", False))
+
+            immediate_packet = None
             with state_lock:
                 is_new = mod_id not in active_nodes
+                prev_rec = active_nodes[mod_id].get("is_recording", False) if not is_new else False
+
                 if is_new:
                     active_nodes[mod_id] = {
                         "last_seen": now,
                         "ip": client_ip,
+                        "is_recording": rec_active,
+                        "recording_elapsed_s": rec_elapsed,
+                        "sim_mode": sim_flag,
                         "latest_reading": hb_reading if isinstance(hb_reading, dict) else None,
                     }
                 else:
                     active_nodes[mod_id]["last_seen"] = now
                     active_nodes[mod_id]["ip"] = client_ip
+                    active_nodes[mod_id]["is_recording"] = rec_active
+                    active_nodes[mod_id]["recording_elapsed_s"] = rec_elapsed
+                    active_nodes[mod_id]["sim_mode"] = sim_flag
                     if isinstance(hb_reading, dict):
                         active_nodes[mod_id]["latest_reading"] = hb_reading
+
                 count = len(active_nodes)
+                if is_new or prev_rec != rec_active:
+                    immediate_packet = build_group_packet_locked(
+                        event_type="capture_state",
+                        trigger_module=mod_id,
+                    )
 
             if is_new:
                 print(f"[{MIDDLE_ID}] Bottom node attached: {mod_id} ({client_ip}) | Active count: {count}")
+            if immediate_packet is not None:
+                if not is_new:
+                    print(f"[{MIDDLE_ID}] {mod_id} recording state -> {'START' if rec_active else 'STOP'}")
+                threading.Thread(target=forward_to_top, args=(immediate_packet,), daemon=True).start()
+
             self._send_json(200, {"ok": True, "middle_id": MIDDLE_ID, "active_count": count})
 
         elif self.path == "/api/detach":
@@ -420,10 +442,19 @@ class MiddleHandler(BaseHTTPRequestHandler):
 
             with state_lock:
                 if mod_id not in active_nodes:
-                    active_nodes[mod_id] = {"last_seen": now, "ip": client_ip, "latest_reading": data}
+                    active_nodes[mod_id] = {
+                        "last_seen": now,
+                        "ip": client_ip,
+                        "is_recording": False,
+                        "recording_elapsed_s": 0.0,
+                        "sim_mode": False,
+                        "latest_reading": data,
+                    }
                 else:
                     active_nodes[mod_id]["last_seen"] = now
                     active_nodes[mod_id]["ip"] = client_ip
+                    active_nodes[mod_id]["is_recording"] = False
+                    active_nodes[mod_id]["recording_elapsed_s"] = 0.0
                     active_nodes[mod_id]["latest_reading"] = data
 
                 csv_path = OUT_DIR / f"{MIDDLE_ID}_received.csv"

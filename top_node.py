@@ -2,7 +2,7 @@
 # Top-Layer Raspberry Pi Coordinator (1 Top Pi <- 3 Middle Pis <- 0~10 Bottom Pis each)
 # Acts as Central Room Directory: supports periodic BLE RSSI Auto-Routing + Manual/API Override.
 # Prunes offline Middle Pis automatically, computes cross-room movement recommendations,
-# and renders full room context & controls on /rooms.
+# and displays live recording status, room context & controls on /rooms.
 
 from __future__ import annotations
 
@@ -182,10 +182,6 @@ def periodic_auto_route_worker(stop_event: threading.Event):
 
 
 def compute_move_recommendations_locked(middles_out: dict[str, dict]) -> dict[str, dict]:
-    """
-    Combines thermal/emotion comfort matching and conflict outlier escalation
-    across all online rooms to recommend target rooms for stressed/conflicting participants.
-    """
     recommendations: dict[str, dict] = {}
     if len(middles_out) < 2:
         return recommendations
@@ -280,6 +276,7 @@ def build_global_snapshot_locked() -> dict:
     prune_stale_middles_locked(now)
 
     total_bottom_active = 0
+    recording_mods: set[str] = set()
     all_bpm = []
     all_eda = []
     all_resp = []
@@ -289,7 +286,9 @@ def build_global_snapshot_locked() -> dict:
     for mid, info in sorted(middle_states.items()):
         pkt = info["packet"]
         total_bottom_active += pkt.get("active_bottom_count", 0)
-        for b_info in pkt.get("bottom_nodes", {}).values():
+        for b_id, b_info in pkt.get("bottom_nodes", {}).items():
+            if b_info.get("is_recording"):
+                recording_mods.add(b_id)
             r = b_info.get("latest_reading")
             if r:
                 if r.get("eda_peaks_2min") is not None:
@@ -308,6 +307,7 @@ def build_global_snapshot_locked() -> dict:
             "rm_temp_c": pkt.get("rm_temp_c", TEMP_THRESHOLD_C),
             "active_bottom_count": pkt.get("active_bottom_count", 0),
             "active_module_ids": pkt.get("active_module_ids", []),
+            "recording_module_ids": pkt.get("recording_module_ids", []),
             "group_summary": pkt.get("group_summary", {}),
             "context_analysis": pkt.get("context_analysis", {}),
             "bottom_nodes": pkt.get("bottom_nodes", {}),
@@ -335,6 +335,8 @@ def build_global_snapshot_locked() -> dict:
         "auto_check_interval_s": AUTO_CHECK_INTERVAL_S,
         "connected_middle_count": len(middle_states),
         "total_active_bottom_count": total_bottom_active,
+        "total_recording_count": len(recording_mods),
+        "recording_module_ids": sorted(recording_mods),
         "room_assignments": room_assignments,
         "ble_rssi": ble_live,
         "move_recommendations": move_recommendations,
@@ -355,7 +357,7 @@ def render_rooms_html() -> str:
   <meta charset="utf-8">
   <title>Vital Cluster — Dynamic Room Router & Context Control</title>
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 1120px; margin: 24px auto; padding: 0 16px; background: #111827; color: #f3f4f6; }
+    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 1200px; margin: 24px auto; padding: 0 16px; background: #111827; color: #f3f4f6; }
     h1 { font-size: 20px; margin-bottom: 6px; }
     h2 { font-size: 16px; margin: 24px 0 10px 0; color: #e5e7eb; }
     p.sub { color: #9ca3af; font-size: 13px; margin-top: 0; }
@@ -367,9 +369,16 @@ def render_rooms_html() -> str:
     button.check { background: #7c3aed; margin-left: 8px; }
     button.move-btn { background: #d97706; font-weight: 600; margin-top: 4px; }
     button.active { outline: 2px solid #fbbf24; font-weight: 700; }
-    .badge { padding: 2px 8px; border-radius: 999px; font-size: 11px; background: #374151; display: inline-block; }
+    .badge { padding: 2px 8px; border-radius: 999px; font-size: 11px; background: #374151; display: inline-block; margin-right: 4px; }
     .badge-ok { background: #065f46; color: #a7f3d0; }
     .badge-warn { background: #991b1b; color: #fecaca; font-weight: 700; }
+    .badge-rec { background: #b91c1c; color: #fef2f2; font-weight: 700; animation: pulseRec 1.4s infinite; }
+    .badge-idle { background: #1e3a8a; color: #bfdbfe; }
+    @keyframes pulseRec {
+      0% { opacity: 1; }
+      50% { opacity: 0.65; }
+      100% { opacity: 1; }
+    }
     .rssi { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px; color: #93c5fd; }
     .mono { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px; }
     .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; margin-top: 10px; }
@@ -391,6 +400,7 @@ def render_rooms_html() -> str:
     <thead>
       <tr>
         <th>Participant (MOD)</th>
+        <th>Capture Status</th>
         <th>Assigned Room</th>
         <th>Mode</th>
         <th>Live BLE Signal</th>
@@ -433,18 +443,32 @@ def render_rooms_html() -> str:
       if (!mids.includes('MID-03')) mids.push('MID-03');
       mids.sort();
 
+      const recMods = data.recording_module_ids || [];
+      const recSummaryBadge = recMods.length > 0
+        ? `<span class="badge badge-rec">● Recording Now (${recMods.length}): ${recMods.join(', ')}</span>`
+        : `<span class="badge">Recording Now: None</span>`;
+
       document.getElementById('middles').innerHTML = mids.map(m => {
         const info = data.middle_nodes[m];
-        return `<span class="badge">${m}: ${info ? info.ip + ' (' + info.active_bottom_count + ' active)' : 'offline'}</span> `;
-      }).join('');
+        return `<span class="badge">${m}: ${info ? info.ip + ' (' + info.active_bottom_count + ' active)' : 'offline'}</span>`;
+      }).join('') + ' ' + recSummaryBadge;
 
       const mods = new Set(Object.keys(data.room_assignments || {}));
       const latestByMod = {};
       const priorityByMod = {};
+      const nodeStateByMod = {};
+
       for (const [mKey, mVal] of Object.entries(data.middle_nodes || {})) {
         (mVal.active_module_ids || []).forEach(id => mods.add(id));
         const bNodes = mVal.bottom_nodes || {};
         for (const [bId, bInfo] of Object.entries(bNodes)) {
+          nodeStateByMod[bId] = {
+            online: true,
+            is_recording: Boolean(bInfo.is_recording),
+            recording_elapsed_s: bInfo.recording_elapsed_s || 0,
+            sim_mode: Boolean(bInfo.sim_mode),
+            room: mKey,
+          };
           if (bInfo.latest_reading) latestByMod[bId] = bInfo.latest_reading;
         }
         const pMap = ((mVal.context_analysis || {}).priority_weights) || {};
@@ -458,6 +482,18 @@ def render_rooms_html() -> str:
       const tbody = document.getElementById('rows');
       tbody.innerHTML = Array.from(mods).sort().map(mod => {
         const cur = (data.room_assignments || {})[mod] || {mid_id: 'MID-01', mode: 'auto'};
+        const st = nodeStateByMod[mod];
+
+        let captureBadge = '<span class="badge">Offline</span>';
+        if (st) {
+          if (st.is_recording) {
+            const simTag = st.sim_mode ? ' [SIM]' : '';
+            captureBadge = `<span class="badge badge-rec">● RECORDING (${Math.round(st.recording_elapsed_s)}s)${simTag}</span>`;
+          } else {
+            captureBadge = '<span class="badge badge-idle">Online (Idle)</span>';
+          }
+        }
+
         const rssiMap = (data.ble_rssi || {})[mod] || {};
         const rssiKeys = Object.keys(rssiMap).sort();
         const rssiText = rssiKeys.length
@@ -488,6 +524,7 @@ def render_rooms_html() -> str:
 
         return `<tr>
           <td><b>${mod}</b></td>
+          <td>${captureBadge}</td>
           <td>${cur.mid_id}</td>
           <td><span class="badge">${cur.mode}</span></td>
           <td class="rssi">${rssiText}</td>
@@ -512,8 +549,14 @@ def render_rooms_html() -> str:
           ? `<span class="badge badge-warn">CONFLICT DETECTED (${ctx.conflict_outlier || '-'})</span>`
           : `<span class="badge badge-ok">STEADY STATE</span>`;
 
+        const activeList = (info.active_module_ids || []).map(id => {
+          const isRec = (info.recording_module_ids || []).includes(id);
+          return isRec ? `<b>${id} (REC)</b>` : id;
+        }).join(', ') || 'None';
+
         return `<div class="card">
           <div class="card-head"><b>${m} (${info.ip})</b>${statusBadge}</div>
+          <div class="kv"><span class="lbl">Active MODs</span><span class="mono">${activeList}</span></div>
           <div class="kv"><span class="lbl">Room Temp / Crowdedness</span><span class="mono">${info.rm_temp_c}°C / ${ctx.crowdedness ?? 0}</span></div>
           <div class="kv"><span class="lbl">AC Target / Device Setting</span><span class="mono"><b>${ctrl.ac_target_temp_c ?? '-'}°C</b> / <b>${ctrl.device_setting ?? 'Random'}</b></span></div>
           <div class="kv"><span class="lbl">Group Context (Eq+Wt)</span><span class="mono">[${ewVec.join(', ')}]</span></div>
