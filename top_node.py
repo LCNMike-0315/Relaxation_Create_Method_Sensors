@@ -286,10 +286,17 @@ def build_global_snapshot_locked() -> dict:
     for mid, info in sorted(middle_states.items()):
         pkt = info["packet"]
         total_bottom_active += pkt.get("active_bottom_count", 0)
+        bottom_nodes_out = {}
+
         for b_id, b_info in pkt.get("bottom_nodes", {}).items():
-            if b_info.get("is_recording"):
+            b_copy = dict(b_info)
+            if b_copy.get("is_recording"):
                 recording_mods.add(b_id)
-            r = b_info.get("latest_reading")
+                base_elapsed = float(b_copy.get("recording_elapsed_s", 0.0))
+                b_copy["recording_elapsed_s"] = round(base_elapsed + max(0.0, now - info["last_seen"]), 1)
+            bottom_nodes_out[b_id] = b_copy
+
+            r = b_copy.get("latest_reading")
             if r:
                 if r.get("eda_peaks_2min") is not None:
                     all_eda.append(r["eda_peaks_2min"])
@@ -310,7 +317,7 @@ def build_global_snapshot_locked() -> dict:
             "recording_module_ids": pkt.get("recording_module_ids", []),
             "group_summary": pkt.get("group_summary", {}),
             "context_analysis": pkt.get("context_analysis", {}),
-            "bottom_nodes": pkt.get("bottom_nodes", {}),
+            "bottom_nodes": bottom_nodes_out,
         }
 
     move_recommendations = compute_move_recommendations_locked(middles_out)
@@ -416,6 +423,9 @@ def render_rooms_html() -> str:
   <div class="cards" id="room-cards"></div>
 
   <script>
+    let latestData = null;
+    let latestFetchMs = 0;
+
     async function assign(modId, midId, mode) {
       await fetch('/api/assign', {
         method: 'POST',
@@ -433,7 +443,15 @@ def render_rooms_html() -> str:
     }
     async function refresh() {
       const res = await fetch('/api/status');
-      const data = await res.json();
+      latestData = await res.json();
+      latestFetchMs = Date.now();
+      renderDashboard();
+    }
+    function renderDashboard() {
+      if (!latestData) return;
+      const data = latestData;
+      const driftSec = (Date.now() - latestFetchMs) / 1000.0;
+
       if (data.auto_check_interval_s) {
         document.getElementById('interval').textContent = data.auto_check_interval_s;
       }
@@ -462,10 +480,11 @@ def render_rooms_html() -> str:
         (mVal.active_module_ids || []).forEach(id => mods.add(id));
         const bNodes = mVal.bottom_nodes || {};
         for (const [bId, bInfo] of Object.entries(bNodes)) {
+          const isRec = Boolean(bInfo.is_recording);
           nodeStateByMod[bId] = {
             online: true,
-            is_recording: Boolean(bInfo.is_recording),
-            recording_elapsed_s: bInfo.recording_elapsed_s || 0,
+            is_recording: isRec,
+            recording_elapsed_s: (bInfo.recording_elapsed_s || 0) + (isRec ? driftSec : 0),
             sim_mode: Boolean(bInfo.sim_mode),
             room: mKey,
           };
@@ -568,6 +587,7 @@ def render_rooms_html() -> str:
     }
     refresh();
     setInterval(refresh, 3000);
+    setInterval(renderDashboard, 1000);
   </script>
 </body>
 </html>"""
