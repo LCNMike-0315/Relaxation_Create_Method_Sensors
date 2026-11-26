@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # Top-Layer Raspberry Pi Coordinator (1 Top Pi <- 3 Middle Pis <- 0~10 Bottom Pis each)
 # Acts as Central Room Directory: supports periodic BLE RSSI Auto-Routing + Manual/API Override.
-# Computes cross-room movement recommendations and renders full room context & controls on /rooms.
+# Prunes offline Middle Pis automatically, computes cross-room movement recommendations,
+# and renders full room context & controls on /rooms.
 
 from __future__ import annotations
 
@@ -27,6 +28,7 @@ ASSIGNMENTS_JSON = OUT_DIR / "TOP_room_assignments.json"
 BLE_STALE_S = 20.0
 BLE_HYSTERESIS_DBM = float(os.getenv("BLE_HYSTERESIS_DBM", "3.0"))
 AUTO_CHECK_INTERVAL_S = float(os.getenv("AUTO_CHECK_INTERVAL_S", "15.0"))
+MIDDLE_STALE_S = float(os.getenv("MIDDLE_STALE_S", "35.0"))
 
 TEMP_THRESHOLD_C = 23.0
 BODY_TEMP_THRESHOLD_C = 36.0
@@ -60,6 +62,16 @@ def save_assignments_locked():
     ASSIGNMENTS_JSON.write_text(json.dumps(room_assignments, indent=2), encoding="utf-8")
 
 
+def prune_stale_middles_locked(now: float):
+    stale_mids = [
+        mid for mid, info in middle_states.items()
+        if (now - info["last_seen"]) > MIDDLE_STALE_S
+    ]
+    for mid in stale_mids:
+        del middle_states[mid]
+        print(f"[{TOP_ID}] Middle Pi offline (timeout > {MIDDLE_STALE_S:.0f}s): {mid}")
+
+
 def default_middle_id_locked() -> str:
     if "MID-01" in middle_states:
         return "MID-01"
@@ -69,6 +81,7 @@ def default_middle_id_locked() -> str:
 
 
 def resolve_route_locked(mod_id: str) -> dict:
+    prune_stale_middles_locked(time.time())
     entry = room_assignments.get(mod_id)
     if entry and entry.get("mid_id"):
         target_mid = entry["mid_id"]
@@ -161,6 +174,7 @@ def periodic_auto_route_worker(stop_event: threading.Event):
             break
         now = time.time()
         with state_lock:
+            prune_stale_middles_locked(now)
             all_mods = set(room_assignments.keys()) | set(ble_observations.keys())
             for mod_id in sorted(all_mods):
                 if room_assignments.get(mod_id, {}).get("mode", "auto") == "auto":
@@ -169,14 +183,13 @@ def periodic_auto_route_worker(stop_event: threading.Event):
 
 def compute_move_recommendations_locked(middles_out: dict[str, dict]) -> dict[str, dict]:
     """
-    Combines thermal/emotion comfort matching (Cell 10) and conflict outlier escalation (Cell 11)
-    across all connected rooms to recommend target rooms for stressed/conflicting participants.
+    Combines thermal/emotion comfort matching and conflict outlier escalation
+    across all online rooms to recommend target rooms for stressed/conflicting participants.
     """
     recommendations: dict[str, dict] = {}
     if len(middles_out) < 2:
         return recommendations
 
-    # Map each room's temperature, focus emotion, and crowdedness
     room_temp_map: dict[str, float] = {}
     room_focus_emotion: dict[str, str] = {}
     room_crowd_map: dict[str, float] = {}
@@ -215,7 +228,6 @@ def compute_move_recommendations_locked(middles_out: dict[str, dict]) -> dict[st
             if body_temp is not None:
                 comfort = "Heat-Sensitive" if float(body_temp) >= BODY_TEMP_THRESHOLD_C else "Cold-Sensitive"
 
-            # 1. Thermal + Emotion matching when conflict/low cos_sim is present
             thermal_mismatch = (
                 (comfort == "Heat-Sensitive" and current_temp >= TEMP_THRESHOLD_C)
                 or (comfort == "Cold-Sensitive" and current_temp < TEMP_THRESHOLD_C)
@@ -243,7 +255,6 @@ def compute_move_recommendations_locked(middles_out: dict[str, dict]) -> dict[st
                                 f"{comfort} ({', '.join(active_emotions)}) -> {alt_mid} ({alt_temp}°C)"
                             )
 
-            # 2. Explicit Conflict Outlier trigger (Fairness target when cos_sim < 0.95)
             if best_target is None and conflict_detected and conflict_outlier == mod_id:
                 alt_candidates = [m for m in sorted(middles_out.keys()) if m != mid]
                 if alt_candidates:
@@ -266,6 +277,8 @@ def compute_move_recommendations_locked(middles_out: dict[str, dict]) -> dict[st
 
 def build_global_snapshot_locked() -> dict:
     now = time.time()
+    prune_stale_middles_locked(now)
+
     total_bottom_active = 0
     all_bpm = []
     all_eda = []
@@ -310,7 +323,7 @@ def build_global_snapshot_locked() -> dict:
                 "age_s": round(now - info["ts"], 1),
             }
             for mid, info in sorted(per_mid.items())
-            if (now - info["ts"]) <= BLE_STALE_S
+            if (now - info["ts"]) <= BLE_STALE_S and mid in middle_states
         }
 
     def avg(vals: list[float]) -> float | None:
@@ -570,6 +583,7 @@ class TopHandler(BaseHTTPRequestHandler):
 
         if self.path == "/api/recheck":
             with state_lock:
+                prune_stale_middles_locked(now)
                 all_mods = set(room_assignments.keys()) | set(ble_observations.keys())
                 for mod_id in sorted(all_mods):
                     if room_assignments.get(mod_id, {}).get("mode", "auto") == "auto":
@@ -674,7 +688,6 @@ class TopHandler(BaseHTTPRequestHandler):
             print("\n" + "=" * 60)
             print(f"[{TOP_ID}] UPDATE from {mid} (trigger: {payload.get('trigger_module')})")
             for m_key, m_val in snapshot["middle_nodes"].items():
-                gs = m_val["group_summary"]
                 ctx = m_val.get("context_analysis") or {}
                 print(
                     f"  • {m_key} (RmTemp={m_val['rm_temp_c']}°C): {m_val['active_bottom_count']} bottom Pis {m_val['active_module_ids']} "
