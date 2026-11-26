@@ -2,7 +2,7 @@
 # Top-Layer Raspberry Pi Coordinator (1 Top Pi <- 3 Middle Pis <- 0~10 Bottom Pis each)
 # Acts as Central Room Directory: supports periodic BLE RSSI Auto-Routing + Manual/API Override.
 # Prunes offline Middle Pis automatically, computes cross-room movement recommendations,
-# and displays live recording status, room context & controls on /rooms.
+# and displays live recording status, real vitals, thermal comfort, stress type & controls on /rooms.
 
 from __future__ import annotations
 
@@ -33,6 +33,7 @@ MIDDLE_STALE_S = float(os.getenv("MIDDLE_STALE_S", "35.0"))
 TEMP_THRESHOLD_C = 23.0
 BODY_TEMP_THRESHOLD_C = 36.0
 EMOTION_NAMES = ["Anxiety", "Displeasure", "Anger"]
+EMOTION_WEIGHTS = [0.4, 0.3, 0.2]
 
 MASTER_HEADER = [
     "top_received_at", "middle_id", "trigger_module",
@@ -181,6 +182,54 @@ def periodic_auto_route_worker(stop_event: threading.Event):
                     evaluate_ble_routing_locked(mod_id, now, force_recheck=False, source_tag="TIMER")
 
 
+def analyze_participant_vitals(reading: dict | None, room_temp_c: float) -> dict | None:
+    """Computes thermal comfort and stress type (Anxiety, Displeasure, Anger) per ipynb rules."""
+    if not isinstance(reading, dict):
+        return None
+
+    norm_vec = reading.get("norm_vec")
+    body_temp = reading.get("mean_temp_c")
+
+    has_norm = isinstance(norm_vec, list) and len(norm_vec) >= 3
+    active_emotions: list[str] = []
+    dominant_stress = "Unknown"
+
+    if has_norm:
+        z_emo = [float(norm_vec[i]) for i in range(3)]
+        active_emotions = [
+            EMOTION_NAMES[i]
+            for i in range(3)
+            if z_emo[i] >= 1.0
+        ]
+        if active_emotions:
+            weighted_scores = [z_emo[i] * EMOTION_WEIGHTS[i] for i in range(3)]
+            best_idx = max(range(3), key=lambda i: weighted_scores[i])
+            dominant_stress = EMOTION_NAMES[best_idx]
+        else:
+            dominant_stress = "Normal"
+
+    comfort = None
+    thermal_mismatch = False
+    if body_temp is not None:
+        bt = float(body_temp)
+        comfort = "Heat-Sensitive" if bt >= BODY_TEMP_THRESHOLD_C else "Cold-Sensitive"
+        thermal_mismatch = (
+            (comfort == "Heat-Sensitive" and room_temp_c >= TEMP_THRESHOLD_C)
+            or (comfort == "Cold-Sensitive" and room_temp_c < TEMP_THRESHOLD_C)
+        )
+
+    return {
+        "eda_peaks_2min": reading.get("eda_peaks_2min"),
+        "mean_bpm": reading.get("mean_bpm"),
+        "resp_rate_min": reading.get("resp_rate_min"),
+        "mean_temp_c": body_temp,
+        "thermal_comfort": comfort,
+        "thermal_mismatch": thermal_mismatch,
+        "stress_types": active_emotions,
+        "dominant_stress": dominant_stress,
+    }
+
+
 def compute_move_recommendations_locked(middles_out: dict[str, dict]) -> dict[str, dict]:
     recommendations: dict[str, dict] = {}
     if len(middles_out) < 2:
@@ -208,26 +257,10 @@ def compute_move_recommendations_locked(middles_out: dict[str, dict]) -> dict[st
         bottom_nodes = m_val.get("bottom_nodes") or {}
 
         for mod_id, b_info in sorted(bottom_nodes.items()):
-            r = b_info.get("latest_reading") or {}
-            norm_vec = r.get("norm_vec")
-            body_temp = r.get("mean_temp_c")
-
-            active_emotions = []
-            if isinstance(norm_vec, list) and len(norm_vec) >= 3:
-                active_emotions = [
-                    EMOTION_NAMES[i]
-                    for i in range(3)
-                    if float(norm_vec[i]) >= 1.0
-                ]
-
-            comfort = None
-            if body_temp is not None:
-                comfort = "Heat-Sensitive" if float(body_temp) >= BODY_TEMP_THRESHOLD_C else "Cold-Sensitive"
-
-            thermal_mismatch = (
-                (comfort == "Heat-Sensitive" and current_temp >= TEMP_THRESHOLD_C)
-                or (comfort == "Cold-Sensitive" and current_temp < TEMP_THRESHOLD_C)
-            )
+            va = b_info.get("vital_analysis") or analyze_participant_vitals(b_info.get("latest_reading"), current_temp) or {}
+            active_emotions = va.get("stress_types", [])
+            comfort = va.get("thermal_comfort")
+            thermal_mismatch = bool(va.get("thermal_mismatch", False))
 
             best_target = None
             reason_parts = []
@@ -285,6 +318,7 @@ def build_global_snapshot_locked() -> dict:
     middles_out = {}
     for mid, info in sorted(middle_states.items()):
         pkt = info["packet"]
+        rm_temp_c = float(pkt.get("rm_temp_c", TEMP_THRESHOLD_C))
         total_bottom_active += pkt.get("active_bottom_count", 0)
         bottom_nodes_out = {}
 
@@ -294,9 +328,11 @@ def build_global_snapshot_locked() -> dict:
                 recording_mods.add(b_id)
                 base_elapsed = float(b_copy.get("recording_elapsed_s", 0.0))
                 b_copy["recording_elapsed_s"] = round(base_elapsed + max(0.0, now - info["last_seen"]), 1)
-            bottom_nodes_out[b_id] = b_copy
 
             r = b_copy.get("latest_reading")
+            b_copy["vital_analysis"] = analyze_participant_vitals(r, rm_temp_c)
+            bottom_nodes_out[b_id] = b_copy
+
             if r:
                 if r.get("eda_peaks_2min") is not None:
                     all_eda.append(r["eda_peaks_2min"])
@@ -311,7 +347,7 @@ def build_global_snapshot_locked() -> dict:
             "ip": info["ip"],
             "port": info.get("port", 8001),
             "last_seen_ago_s": round(now - info["last_seen"], 1),
-            "rm_temp_c": pkt.get("rm_temp_c", TEMP_THRESHOLD_C),
+            "rm_temp_c": rm_temp_c,
             "active_bottom_count": pkt.get("active_bottom_count", 0),
             "active_module_ids": pkt.get("active_module_ids", []),
             "recording_module_ids": pkt.get("recording_module_ids", []),
@@ -364,23 +400,26 @@ def render_rooms_html() -> str:
   <meta charset="utf-8">
   <title>Vital Cluster — Dynamic Room Router & Context Control</title>
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 1200px; margin: 24px auto; padding: 0 16px; background: #111827; color: #f3f4f6; }
+    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 1460px; margin: 24px auto; padding: 0 16px; background: #111827; color: #f3f4f6; }
     h1 { font-size: 20px; margin-bottom: 6px; }
     h2 { font-size: 16px; margin: 24px 0 10px 0; color: #e5e7eb; }
     p.sub { color: #9ca3af; font-size: 13px; margin-top: 0; }
     table { width: 100%; border-collapse: collapse; margin-top: 12px; background: #1f2937; border-radius: 8px; overflow: hidden; }
-    th, td { padding: 10px 12px; border-bottom: 1px solid #374151; text-align: left; font-size: 13px; vertical-align: middle; }
+    th, td { padding: 10px 10px; border-bottom: 1px solid #374151; text-align: left; font-size: 13px; vertical-align: middle; }
     th { background: #0f172a; color: #9ca3af; font-weight: 600; }
-    button { background: #2563eb; color: #fff; border: none; padding: 6px 10px; border-radius: 6px; cursor: pointer; margin-right: 4px; font-size: 12px; }
+    button { background: #2563eb; color: #fff; border: none; padding: 6px 9px; border-radius: 6px; cursor: pointer; margin-right: 4px; font-size: 12px; }
     button.auto { background: #059669; }
     button.check { background: #7c3aed; margin-left: 8px; }
     button.move-btn { background: #d97706; font-weight: 600; margin-top: 4px; }
     button.active { outline: 2px solid #fbbf24; font-weight: 700; }
-    .badge { padding: 2px 8px; border-radius: 999px; font-size: 11px; background: #374151; display: inline-block; margin-right: 4px; }
+    .badge { padding: 2px 8px; border-radius: 999px; font-size: 11px; background: #374151; display: inline-block; margin-right: 4px; margin-top: 2px; }
     .badge-ok { background: #065f46; color: #a7f3d0; }
     .badge-warn { background: #991b1b; color: #fecaca; font-weight: 700; }
     .badge-rec { background: #b91c1c; color: #fef2f2; font-weight: 700; animation: pulseRec 1.4s infinite; }
     .badge-idle { background: #1e3a8a; color: #bfdbfe; }
+    .badge-heat { background: #9a3412; color: #fed7aa; font-weight: 600; }
+    .badge-cold { background: #075985; color: #bae6fd; font-weight: 600; }
+    .badge-stress { background: #7f1d1d; color: #fecaca; font-weight: 600; }
     @keyframes pulseRec {
       0% { opacity: 1; }
       50% { opacity: 0.65; }
@@ -411,6 +450,7 @@ def render_rooms_html() -> str:
         <th>Assigned Room</th>
         <th>Mode</th>
         <th>Live BLE Signal</th>
+        <th>Vitals, Comfort & Stress</th>
         <th>Adaptability / Priority</th>
         <th>Movement Recommendation</th>
         <th>Switch Room</th>
@@ -440,6 +480,9 @@ def render_rooms_html() -> str:
     }
     function fmtSim(v) {
       return (v === null || v === undefined) ? '-' : Number(v).toFixed(4);
+    }
+    function fmtVal(v, suffix = '') {
+      return (v === null || v === undefined || v === '') ? '-' : `${v}${suffix}`;
     }
     async function refresh() {
       const res = await fetch('/api/status');
@@ -473,6 +516,7 @@ def render_rooms_html() -> str:
 
       const mods = new Set(Object.keys(data.room_assignments || {}));
       const latestByMod = {};
+      const vitalAnalysisByMod = {};
       const priorityByMod = {};
       const nodeStateByMod = {};
 
@@ -489,6 +533,7 @@ def render_rooms_html() -> str:
             room: mKey,
           };
           if (bInfo.latest_reading) latestByMod[bId] = bInfo.latest_reading;
+          if (bInfo.vital_analysis) vitalAnalysisByMod[bId] = bInfo.vital_analysis;
         }
         const pMap = ((mVal.context_analysis || {}).priority_weights) || {};
         for (const [pId, pVal] of Object.entries(pMap)) {
@@ -520,6 +565,38 @@ def render_rooms_html() -> str:
           : 'No BLE beacon detected yet';
 
         const rData = latestByMod[mod];
+        const va = vitalAnalysisByMod[mod];
+        let vitalsHtml = '<span style="color:#9ca3af;">Waiting for capture...</span>';
+        if (rData) {
+          const eda = fmtVal(rData.eda_peaks_2min);
+          const hr = fmtVal(rData.mean_bpm, ' bpm');
+          const rr = fmtVal(rData.resp_rate_min, '/m');
+          const bt = fmtVal(rData.mean_temp_c, '°C');
+
+          let comfortBadge = '';
+          if (va && va.thermal_comfort) {
+            const cCls = va.thermal_comfort === 'Heat-Sensitive' ? 'badge-heat' : 'badge-cold';
+            const warnTag = va.thermal_mismatch ? ' (!)' : '';
+            comfortBadge = `<span class="badge ${cCls}">${va.thermal_comfort}${warnTag}</span>`;
+          }
+
+          let stressBadge = '<span class="badge badge-ok">Normal</span>';
+          if (va) {
+            const sTypes = va.stress_types || [];
+            if (sTypes.length > 0) {
+              stressBadge = sTypes.map(s => {
+                const domTag = (sTypes.length > 1 && s === va.dominant_stress) ? ' ★' : '';
+                return `<span class="badge badge-stress">${s}${domTag}</span>`;
+              }).join('');
+            } else if (va.dominant_stress === 'Unknown') {
+              stressBadge = '<span class="badge">Stress: N/A</span>';
+            }
+          }
+
+          vitalsHtml = `<div class="mono">EDA:${eda} | HR:${hr} | RR:${rr} | Temp:${bt}</div>`
+            + `<div style="margin-top:3px;">${comfortBadge}${stressBadge}</div>`;
+        }
+
         let statText = '<span style="color:#9ca3af;">Waiting for capture...</span>';
         if (rData) {
           const sc = (rData.adaptability_score !== undefined) ? rData.adaptability_score : '-';
@@ -547,6 +624,7 @@ def render_rooms_html() -> str:
           <td>${cur.mid_id}</td>
           <td><span class="badge">${cur.mode}</span></td>
           <td class="rssi">${rssiText}</td>
+          <td>${vitalsHtml}</td>
           <td>${statText}</td>
           <td>${recHtml}</td>
           <td>${btns}</td>
