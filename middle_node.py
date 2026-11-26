@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # Middle-Layer Raspberry Pi Aggregator (3 Middle Pis: MID-01, MID-02, MID-03)
-# Receives from 0~10 dynamic Bottom Pis -> Aggregates & forwards to 1 Top Pi
+# Receives from 0~10 dynamic Bottom Pis -> Computes Room Context Vectors, Cosine Similarities,
+# Conflict Detection, and Room Device/HVAC Controls -> Forwards to Top Pi.
 # Supports clean /api/detach on room switches and BLE RSSI room scanning.
 
 from __future__ import annotations
@@ -8,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import json
+import math
 import os
 import socket
 import threading
@@ -27,14 +29,172 @@ ACTIVE_TIMEOUT_S = 40.0     # Bottom Pi removed from active list if silent > 40s
 SYNC_INTERVAL_S = 15.0      # Periodic heartbeat/roster sync to Top Pi
 BLE_SCAN_INTERVAL_S = 3.0   # BLE proximity scan cadence (if bleak is installed)
 
+# --- CONTEXT & ENVIRONMENTAL CONTROL PARAMETERS (from SPA_final_v9.ipynb) ---
+INDICATOR_WEIGHTS = [0.4, 0.3, 0.2, 0.1]
+COS_SIM_CONFLICT_THRESHOLD = 0.95
+EMOTION_CONTROL_THRESHOLD = 0.8
+TEMP_THRESHOLD_C = 23.0
+ROOM_CAPACITY = 10.0
+
+# Fixed fallback room temperature until physical sensor is attached to mid-01/02/03
+DEFAULT_RM_TEMP_C = float(os.getenv("RM_TEMP", "23.0"))
+
 RECEIVED_HEADER = [
     "received_at", "middle_id", "module_id", "duration_s",
-    "eda_peaks_2min", "mean_bpm", "resp_rate_min", "mean_temp_c"
+    "eda_peaks_2min", "mean_bpm", "resp_rate_min", "mean_temp_c",
+    "adaptability_score"
 ]
 
 state_lock = threading.Lock()
 # active_nodes[module_id] = {"last_seen": float, "ip": str, "latest_reading": dict | None}
 active_nodes: dict[str, dict] = {}
+
+
+def read_room_temperature() -> float:
+    """
+    Returns current room temperature (°C).
+    When adding a physical temperature sensor (e.g., BME280/SHT31) to mid-01/mid-02/mid-03,
+    implement the hardware read inside [HARDWARE SENSOR HOOK] below.
+    """
+    # --- [HARDWARE SENSOR HOOK] ---------------------------------
+    # try:
+    #     return round(read_physical_temp_sensor(), 2)
+    # except Exception:
+    #     pass
+    # ------------------------------------------------------------
+    return round(DEFAULT_RM_TEMP_C, 2)
+
+
+def cosine_similarity(v1: list[float], v2: list[float]) -> float:
+    dot = sum(a * b for a, b in zip(v1, v2))
+    n1 = math.sqrt(sum(a * a for a in v1))
+    n2 = math.sqrt(sum(b * b for b in v2))
+    return dot / (n1 * n2) if (n1 > 0 and n2 > 0) else 0.0
+
+
+def control_room_devices(state_vector: list[float], current_temp_c: float) -> dict:
+    """Determines actuator emotion setting & AC target temperature."""
+    emo_vec = state_vector[:3]
+    max_emo = max(emo_vec) if emo_vec else 0.0
+    dom_idx = emo_vec.index(max_emo) if emo_vec else 0
+
+    emotion_setting = "Random"
+    if max_emo > EMOTION_CONTROL_THRESHOLD:
+        emotion_map = {0: "Anxiety", 1: "Displeasure", 2: "Anger"}
+        emotion_setting = emotion_map.get(dom_idx, "Random")
+
+    target_temp = 22.0 if current_temp_c >= TEMP_THRESHOLD_C else 25.0
+    return {
+        "device_setting": emotion_setting,
+        "ac_target_temp_c": target_temp,
+    }
+
+
+def compute_room_context_locked(rm_temp_c: float) -> dict:
+    """
+    Computes room context vectors across 3 strategies (Equality, Equality With Weight, Fairness),
+    cosine similarities against the group sum vector, conflict detection (< 0.95),
+    and room device/HVAC commands without numpy/scipy.
+    """
+    ids_with_vecs = []
+    norm_by_id: dict[str, list[float]] = {}
+    score_by_id: dict[str, float] = {}
+
+    for mod_id in sorted(active_nodes.keys()):
+        r = active_nodes[mod_id].get("latest_reading")
+        if r and isinstance(r.get("norm_vec"), list) and len(r["norm_vec"]) >= 4:
+            ids_with_vecs.append(mod_id)
+            norm_by_id[mod_id] = [float(x) for x in r["norm_vec"][:4]]
+            score_by_id[mod_id] = float(r.get("adaptability_score", 0.0))
+
+    crowdedness = round(len(active_nodes) / ROOM_CAPACITY, 2)
+
+    if not ids_with_vecs:
+        zero_vec = [0.0, 0.0, 0.0, 0.0]
+        return {
+            "evaluated_count": 0,
+            "rm_temp_c": rm_temp_c,
+            "crowdedness": crowdedness,
+            "strategy_vectors": {
+                "Equality": zero_vec,
+                "Equality With Weight": zero_vec,
+                "Fairness": zero_vec,
+            },
+            "cosine_similarity": {
+                "Equality": None,
+                "Equality With Weight": None,
+                "Fairness": None,
+            },
+            "conflict_detected": False,
+            "conflict_outlier": None,
+            "priority_weights": {},
+            "fairness_target": None,
+            "room_control": control_room_devices(zero_vec, rm_temp_c),
+        }
+
+    n = len(ids_with_vecs)
+
+    # 1. Priorities for each strategy
+    pri_equality = [1.0] * n
+
+    total_score = sum(score_by_id[pid] for pid in ids_with_vecs)
+    if total_score == 0 or n == 1:
+        pri_eq_weight = [1.0] * n
+    else:
+        pri_eq_weight = [1.0 - (score_by_id[pid] / total_score) for pid in ids_with_vecs]
+
+    fairness_target = min(ids_with_vecs, key=lambda pid: score_by_id[pid])
+    pri_fairness = [1.0 if pid == fairness_target else 0.0 for pid in ids_with_vecs]
+
+    strategy_pri_map = {
+        "Equality": pri_equality,
+        "Equality With Weight": pri_eq_weight,
+        "Fairness": pri_fairness,
+    }
+
+    # 2. Diagonal extraction equivalent: state_vec[j] = weights[j] * sum_i(pri[i] * I[i][j])
+    strategy_vectors: dict[str, list[float]] = {}
+    for strat_name, pris in strategy_pri_map.items():
+        vec = []
+        for j in range(4):
+            weighted_sum = sum(pris[i] * norm_by_id[ids_with_vecs[i]][j] for i in range(n))
+            vec.append(round(INDICATOR_WEIGHTS[j] * weighted_sum, 4))
+        strategy_vectors[strat_name] = vec
+
+    # 3. Cosine similarity against 3-emotion simple sum vector
+    group_emo_sum = [
+        sum(norm_by_id[pid][j] for pid in ids_with_vecs)
+        for j in range(3)
+    ]
+
+    cos_sims: dict[str, float] = {}
+    conflict_detected = False
+    for strat_name, vec in strategy_vectors.items():
+        sim = round(cosine_similarity(vec[:3], group_emo_sum), 4)
+        cos_sims[strat_name] = sim
+        if sum(group_emo_sum) > 0 and sim < COS_SIM_CONFLICT_THRESHOLD:
+            conflict_detected = True
+
+    # 4. Room device & AC control driven by Equality With Weight context vector
+    room_control = control_room_devices(strategy_vectors["Equality With Weight"], rm_temp_c)
+
+    priority_weights = {
+        pid: round(pri_eq_weight[idx], 3)
+        for idx, pid in enumerate(ids_with_vecs)
+    }
+
+    return {
+        "evaluated_count": n,
+        "rm_temp_c": rm_temp_c,
+        "crowdedness": crowdedness,
+        "strategy_vectors": strategy_vectors,
+        "cosine_similarity": cos_sims,
+        "conflict_detected": conflict_detected,
+        "conflict_outlier": fairness_target if conflict_detected else None,
+        "priority_weights": priority_weights,
+        "fairness_target": fairness_target,
+        "room_control": room_control,
+    }
 
 
 def get_top_url() -> str:
@@ -77,6 +237,9 @@ def build_group_packet_locked(event_type: str, trigger_module: str | None = None
     now = time.time()
     prune_stale_nodes_locked(now)
 
+    rm_temp_c = read_room_temperature()
+    context_analysis = compute_room_context_locked(rm_temp_c)
+
     readings = [
         info["latest_reading"]
         for info in active_nodes.values()
@@ -93,6 +256,7 @@ def build_group_packet_locked(event_type: str, trigger_module: str | None = None
         "listen_port": LISTEN_PORT,
         "event": event_type,
         "trigger_module": trigger_module,
+        "rm_temp_c": rm_temp_c,
         "active_bottom_count": len(active_nodes),
         "reporting_bottom_count": len(readings),
         "active_module_ids": sorted(active_nodes.keys()),
@@ -102,6 +266,7 @@ def build_group_packet_locked(event_type: str, trigger_module: str | None = None
             "mean_resp_rate_min": avg_field("resp_rate_min"),
             "mean_temp_c": avg_field("mean_temp_c"),
         },
+        "context_analysis": context_analysis,
         "bottom_nodes": {
             mid: {
                 "ip": info["ip"],
@@ -173,7 +338,7 @@ def ble_scanner_worker(stop_event: threading.Event):
 
 class MiddleHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args):
-        return  # Keep console output clean
+        return
 
     def _send_json(self, code: int, body: dict):
         raw = json.dumps(body).encode("utf-8")
@@ -208,13 +373,20 @@ class MiddleHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "Missing module_id"})
                 return
 
+            hb_reading = data.get("latest_reading")
             with state_lock:
                 is_new = mod_id not in active_nodes
                 if is_new:
-                    active_nodes[mod_id] = {"last_seen": now, "ip": client_ip, "latest_reading": None}
+                    active_nodes[mod_id] = {
+                        "last_seen": now,
+                        "ip": client_ip,
+                        "latest_reading": hb_reading if isinstance(hb_reading, dict) else None,
+                    }
                 else:
                     active_nodes[mod_id]["last_seen"] = now
                     active_nodes[mod_id]["ip"] = client_ip
+                    if isinstance(hb_reading, dict):
+                        active_nodes[mod_id]["latest_reading"] = hb_reading
                 count = len(active_nodes)
 
             if is_new:
@@ -269,16 +441,19 @@ class MiddleHandler(BaseHTTPRequestHandler):
                         data.get("mean_bpm", ""),
                         data.get("resp_rate_min", ""),
                         data.get("mean_temp_c", ""),
+                        data.get("adaptability_score", ""),
                     ])
 
                 packet = build_group_packet_locked(event_type="reading", trigger_module=mod_id)
 
             sent_top = forward_to_top(packet)
             gs = packet["group_summary"]
+            ctx = packet["context_analysis"]
             print(
                 f"[{MIDDLE_ID}] Reading from {mod_id} | Active={packet['active_bottom_count']} "
-                f"| GroupAvg(EDA={gs['mean_eda_peaks_2min']}, BPM={gs['mean_bpm']}, "
-                f"Resp={gs['mean_resp_rate_min']}, Temp={gs['mean_temp_c']}) "
+                f"| Avg(EDA={gs['mean_eda_peaks_2min']}, BPM={gs['mean_bpm']}, "
+                f"Resp={gs['mean_resp_rate_min']}, BodyTemp={gs['mean_temp_c']}) "
+                f"| Ctrl={ctx['room_control']} | Conflict={ctx['conflict_detected']} "
                 f"-> TopPi: {'SENT' if sent_top else 'UNREACHABLE'}"
             )
             self._send_json(200, {"ok": True, "forwarded_to_top": sent_top})
@@ -294,7 +469,7 @@ def main():
     threading.Thread(target=ble_scanner_worker, args=(stop_event,), daemon=True).start()
 
     server = ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), MiddleHandler)
-    print(f"[{MIDDLE_ID}] Listening on 0.0.0.0:{LISTEN_PORT}")
+    print(f"[{MIDDLE_ID}] Listening on 0.0.0.0:{LISTEN_PORT} (RmTemp={read_room_temperature()}°C)")
     print(f"[{MIDDLE_ID}] Target Top Pi: {get_top_url() or 'Not configured (set top_url.txt)'}")
     try:
         server.serve_forever()

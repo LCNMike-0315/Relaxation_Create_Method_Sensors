@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # Bottom-Layer Vital-Sign Sensor Node (0~10 per Middle Pi)
-# Connects: Webcam + micro:bit (GSR, BPM, Temp) -> Streams 2-min summary to assigned Middle Pi.
+# Connects: Webcam + micro:bit (GSR, BPM, Temp) -> Computes personal baseline Z-scores & adaptability
+# -> Streams 2-min summary & metrics to assigned Middle Pi.
 # Broadcasts persistent BLE beacon (MODULE_ID) for proximity routing & resolves room from Top Pi.
 # Automatically switches to simulated sensors if no micro:bit is connected (or with --sim).
 
@@ -20,6 +21,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import deque
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -37,12 +39,20 @@ OUT_DIR = Path("data")
 TOP_URL_FILE = Path("top_url.txt")         # Points to Top Pi (http://10.37.23.195:8000) for dynamic room routing
 MIDDLE_URL_FILE = Path("middle_url.txt")   # Auto-updated cache / manual fallback if Top Pi is offline
 QUEUE_FILE = OUT_DIR / f"{MODULE_ID}_unsent.jsonl"
+HISTORY_FILE = OUT_DIR / f"{MODULE_ID}_history.json"
 HEARTBEAT_INTERVAL_S = 5.0
+HISTORY_MAX_LEN = 50
+
+# Fallback baseline stats when personal history < 5 sessions (matches SPA_final_v9.ipynb)
+DEFAULT_BASELINE_MEAN = [20.48, 77.74, 20.71, 36.0]
+DEFAULT_BASELINE_STD = [6.02, 23.48, 5.70, 1.0]
 
 RAW_HEADER = ["pi_time", "mb_ms", "gsr", "bpm", "temp_raw", "temp_c"]
 SUMMARY_HEADER = [
     "timestamp", "module_id", "assigned_room", "duration_s",
-    "eda_peaks_2min", "mean_bpm", "resp_rate_min", "mean_temp_c", "sent_to_middle"
+    "eda_peaks_2min", "mean_bpm", "resp_rate_min", "mean_temp_c",
+    "norm_eda", "norm_bpm", "norm_resp", "norm_temp",
+    "adaptability_score", "sent_to_middle"
 ]
 
 # Grove Temperature Sensor v1.2 (100k NTC thermistor, B=4250)
@@ -53,6 +63,137 @@ route_lock = threading.Lock()
 current_mid_id: str = "UNASSIGNED"
 current_middle_url: str = ""
 _bt_proc: subprocess.Popen | None = None
+
+metrics_lock = threading.Lock()
+history_buffer: deque[dict] = deque(maxlen=HISTORY_MAX_LEN)
+latest_payload_cache: dict | None = None
+
+
+# --- PURE-PYTHON STATISTICAL HELPERS (No numpy/scipy required) ---
+def percentile_25(values: list[float]) -> float:
+    s = sorted(values)
+    n = len(s)
+    if n == 0:
+        return 0.0
+    if n == 1:
+        return float(s[0])
+    pos = 0.25 * (n - 1)
+    lo = math.floor(pos)
+    hi = math.ceil(pos)
+    if lo == hi:
+        return float(s[lo])
+    return float(s[lo] + (pos - lo) * (s[hi] - s[lo]))
+
+
+def pop_std(values: list[float]) -> float:
+    n = len(values)
+    if n == 0:
+        return 0.0
+    mu = sum(values) / n
+    return math.sqrt(sum((x - mu) ** 2 for x in values) / n)
+
+
+def linear_slope(values: list[float]) -> float:
+    n = len(values)
+    if n < 2:
+        return 0.0
+    x_mean = (n - 1) / 2.0
+    y_mean = sum(values) / n
+    num = sum((i - x_mean) * (y - y_mean) for i, y in enumerate(values))
+    den = sum((i - x_mean) ** 2 for i in range(n))
+    return num / den if den > 0 else 0.0
+
+
+def load_personal_history():
+    global latest_payload_cache
+    if not HISTORY_FILE.exists():
+        return
+    try:
+        raw = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+        if isinstance(raw, list):
+            with metrics_lock:
+                history_buffer.clear()
+                for item in raw[-HISTORY_MAX_LEN:]:
+                    if isinstance(item, dict) and "vitals" in item:
+                        history_buffer.append(item)
+                if history_buffer and "last_payload" in history_buffer[-1]:
+                    latest_payload_cache = history_buffer[-1]["last_payload"]
+    except Exception:
+        pass
+
+
+def save_personal_history_locked():
+    OUT_DIR.mkdir(exist_ok=True)
+    try:
+        HISTORY_FILE.write_text(json.dumps(list(history_buffer), indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def compute_personal_metrics(
+    eda_2min: float,
+    avg_bpm: float,
+    resp_rate: float,
+    avg_temp_c: float,
+    ts_iso: str,
+) -> tuple[list[float], dict]:
+    """
+    Replicates cal() and calculate_adaptability_score() from SPA_final_v9.ipynb:
+    - Uses 25th percentile baseline & std when history >= 5 points.
+    - Computes slope + delta adaptability score across [E, H, R, BodyTemp].
+    """
+    clean_vitals = [
+        float(eda_2min) if not math.isnan(eda_2min) else DEFAULT_BASELINE_MEAN[0],
+        float(avg_bpm) if not math.isnan(avg_bpm) else DEFAULT_BASELINE_MEAN[1],
+        float(resp_rate) if not math.isnan(resp_rate) else DEFAULT_BASELINE_MEAN[2],
+        float(avg_temp_c) if not math.isnan(avg_temp_c) else DEFAULT_BASELINE_MEAN[3],
+    ]
+
+    with metrics_lock:
+        history_buffer.append({"ts": ts_iso, "vitals": clean_vitals})
+        hist_list = [entry["vitals"] for entry in history_buffer]
+
+        if len(hist_list) < 5:
+            means = list(DEFAULT_BASELINE_MEAN)
+            stds = list(DEFAULT_BASELINE_STD)
+        else:
+            means = [percentile_25([row[i] for row in hist_list]) for i in range(4)]
+            stds = [pop_std([row[i] for row in hist_list]) for i in range(4)]
+
+        norm_vec = []
+        for i in range(4):
+            s_val = stds[i] if (stds[i] > 0 and not math.isnan(stds[i])) else 1.0
+            z = abs((clean_vitals[i] - means[i]) / s_val)
+            norm_vec.append(round(z, 2))
+
+        if len(hist_list) > 1:
+            e_series = [row[0] for row in hist_list]
+            h_series = [row[1] for row in hist_list]
+            r_series = [row[2] for row in hist_list]
+            bt_series = [row[3] for row in hist_list]
+
+            emotion_slope = (
+                linear_slope(e_series) + linear_slope(h_series) + linear_slope(r_series)
+            ) / 3.0
+            bodytemp_slope = linear_slope(bt_series)
+
+            emotion_deltas = (
+                abs(e_series[-1] - e_series[-2])
+                + abs(h_series[-1] - h_series[-2])
+                + abs(r_series[-1] - r_series[-2])
+            )
+            bodytemp_delta = abs(bt_series[-1] - bt_series[-2])
+
+            slope_val = round(emotion_slope + bodytemp_slope, 3)
+            delta_val = round(emotion_deltas + bodytemp_delta, 3)
+            score_val = round(slope_val + delta_val, 3)
+        else:
+            slope_val = 0.0
+            delta_val = 0.0
+            score_val = 0.0
+
+        adapt_dict = {"slope": slope_val, "delta": delta_val, "score": score_val}
+        return norm_vec, adapt_dict
 
 
 def get_top_url() -> str:
@@ -177,7 +318,6 @@ def start_ble_beacon():
             except Exception:
                 pass
 
-    # Keep a persistent bluetoothctl process alive so D-Bus LEAdvertisement1 stays registered
     if shutil.which("bluetoothctl") and _bt_proc is None:
         try:
             _bt_proc = subprocess.Popen(
@@ -233,14 +373,19 @@ def flush_unsent_queue(middle_url: str):
 
 
 def heartbeat_worker(stop_event: threading.Event):
-    """Syncs room assignment from Top Pi and registers heartbeat with assigned Middle Pi."""
+    """Syncs room assignment from Top Pi and registers heartbeat (with latest metrics) on Middle Pi."""
     while not stop_event.is_set():
         sync_dynamic_route()
-        _mid_id, middle_url = get_active_route()
+        mid_id, middle_url = get_active_route()
         if middle_url:
+            with metrics_lock:
+                cached = dict(latest_payload_cache) if latest_payload_cache else None
+            if cached is not None:
+                cached["assigned_room"] = mid_id
             payload = {
                 "module_id": MODULE_ID,
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "latest_reading": cached,
             }
             ok = post_json(f"{middle_url}/api/heartbeat", payload, timeout=3.0)
             if ok:
@@ -467,6 +612,7 @@ def mean(values: list[float]) -> float:
 
 
 def finalize_session(rows: list[tuple], resp_result: dict, wall_duration_s: float):
+    global latest_payload_cache
     if not rows:
         print("  [!] No data rows recorded.")
         sync_dynamic_route()
@@ -482,6 +628,14 @@ def finalize_session(rows: list[tuple], resp_result: dict, wall_duration_s: floa
     avg_temp_c = mean(temp_c_list)
     ts_iso = datetime.now().isoformat(timespec="seconds")
 
+    norm_vec, adapt_dict = compute_personal_metrics(
+        eda_2min=eda_2min,
+        avg_bpm=avg_bpm,
+        resp_rate=resp_rate,
+        avg_temp_c=avg_temp_c,
+        ts_iso=ts_iso,
+    )
+
     mid_id, middle_url = get_active_route()
 
     payload = {
@@ -493,7 +647,16 @@ def finalize_session(rows: list[tuple], resp_result: dict, wall_duration_s: floa
         "mean_bpm": round(avg_bpm, 1) if not math.isnan(avg_bpm) else None,
         "resp_rate_min": resp_rate,
         "mean_temp_c": round(avg_temp_c, 2) if not math.isnan(avg_temp_c) else None,
+        "norm_vec": norm_vec,
+        "adaptability": adapt_dict,
+        "adaptability_score": adapt_dict["score"],
     }
+
+    with metrics_lock:
+        latest_payload_cache = dict(payload)
+        if history_buffer:
+            history_buffer[-1]["last_payload"] = dict(payload)
+        save_personal_history_locked()
 
     sent_ok = False
     if middle_url:
@@ -502,14 +665,16 @@ def finalize_session(rows: list[tuple], resp_result: dict, wall_duration_s: floa
             with open(QUEUE_FILE, "a", encoding="utf-8") as qf:
                 qf.write(json.dumps(payload) + "\n")
 
-    print("\n" + "=" * 52)
+    print("\n" + "=" * 56)
     print(f"MODULE {MODULE_ID} ({mid_id}) — 2-MIN RESULT ({wall_duration_s:.1f}s)")
     print(f"  1. EDA / 2min          : {eda_2min} (GSR range: {min(gsr_list)}-{max(gsr_list)})")
     print(f"  2. Heart Rate (BPM)    : {avg_bpm:.1f}")
     print(f"  3. Respiration Rate    : {resp_rate}")
     print(f"  4. Avg Temperature     : {avg_temp_c:.2f} °C")
+    print(f"  5. Norm Vector (Z)     : {norm_vec}")
+    print(f"  6. Adaptability Score  : {adapt_dict['score']} (slope={adapt_dict['slope']}, delta={adapt_dict['delta']})")
     print(f"  -> Middle Pi ({mid_id} @ {middle_url or 'UNSET'}): {'SENT' if sent_ok else 'QUEUED/LOCAL'}")
-    print("=" * 52 + "\n")
+    print("=" * 56 + "\n")
 
     summary_path = OUT_DIR / f"{MODULE_ID}_summary.csv"
     write_header = not summary_path.exists()
@@ -526,10 +691,14 @@ def finalize_session(rows: list[tuple], resp_result: dict, wall_duration_s: floa
             payload["mean_bpm"] if payload["mean_bpm"] is not None else "",
             resp_rate,
             payload["mean_temp_c"] if payload["mean_temp_c"] is not None else "",
+            norm_vec[0],
+            norm_vec[1],
+            norm_vec[2],
+            norm_vec[3],
+            adapt_dict["score"],
             "1" if sent_ok else "0",
         ])
 
-    # Re-check Bluetooth / dynamic room assignment right after finishing sensing
     sync_dynamic_route()
 
 
@@ -625,6 +794,7 @@ def main():
     port = None if force_sim else (cli_args[0] if cli_args else find_port())
 
     OUT_DIR.mkdir(exist_ok=True)
+    load_personal_history()
     start_ble_beacon()
     sync_dynamic_route()
 

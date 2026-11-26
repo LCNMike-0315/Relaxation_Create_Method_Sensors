@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # Top-Layer Raspberry Pi Coordinator (1 Top Pi <- 3 Middle Pis <- 0~10 Bottom Pis each)
 # Acts as Central Room Directory: supports periodic BLE RSSI Auto-Routing + Manual/API Override.
+# Computes cross-room movement recommendations and renders full room context & controls on /rooms.
 
 from __future__ import annotations
 
@@ -23,9 +24,13 @@ MASTER_CSV = OUT_DIR / "TOP_master_readings.csv"
 LATEST_JSON = OUT_DIR / "TOP_latest_state.json"
 ASSIGNMENTS_JSON = OUT_DIR / "TOP_room_assignments.json"
 
-BLE_STALE_S = 20.0                                          # Ignore BLE RSSI readings older than 20s
+BLE_STALE_S = 20.0
 BLE_HYSTERESIS_DBM = float(os.getenv("BLE_HYSTERESIS_DBM", "3.0"))
 AUTO_CHECK_INTERVAL_S = float(os.getenv("AUTO_CHECK_INTERVAL_S", "15.0"))
+
+TEMP_THRESHOLD_C = 23.0
+BODY_TEMP_THRESHOLD_C = 36.0
+EMOTION_NAMES = ["Anxiety", "Displeasure", "Anger"]
 
 MASTER_HEADER = [
     "top_received_at", "middle_id", "trigger_module",
@@ -35,13 +40,8 @@ MASTER_HEADER = [
 ]
 
 state_lock = threading.Lock()
-# middle_states[middle_id] = {"last_seen": float, "ip": str, "port": int, "packet": dict}
 middle_states: dict[str, dict] = {}
-
-# room_assignments[mod_id] = {"mid_id": "MID-01", "mode": "manual" | "auto", "updated_at": str}
 room_assignments: dict[str, dict] = {}
-
-# ble_observations[mod_id][mid_id] = {"rssi": float, "ts": float}
 ble_observations: dict[str, dict[str, dict]] = {}
 
 
@@ -69,7 +69,6 @@ def default_middle_id_locked() -> str:
 
 
 def resolve_route_locked(mod_id: str) -> dict:
-    """Returns target Middle Pi ID and URL for a given Bottom Pi."""
     entry = room_assignments.get(mod_id)
     if entry and entry.get("mid_id"):
         target_mid = entry["mid_id"]
@@ -85,10 +84,7 @@ def resolve_route_locked(mod_id: str) -> dict:
         save_assignments_locked()
 
     m_info = middle_states.get(target_mid)
-    if m_info:
-        middle_url = f"http://{m_info['ip']}:{m_info.get('port', 8001)}"
-    else:
-        middle_url = ""
+    middle_url = f"http://{m_info['ip']}:{m_info.get('port', 8001)}" if m_info else ""
 
     return {
         "ok": True,
@@ -105,7 +101,6 @@ def evaluate_ble_routing_locked(
     force_recheck: bool = False,
     source_tag: str = "BLE",
 ):
-    """Auto-assigns mod_id to the strongest BLE room unless pinned in 'manual' mode."""
     current = room_assignments.get(mod_id, {})
     if current.get("mode") == "manual":
         return
@@ -160,7 +155,6 @@ def evaluate_ble_routing_locked(
 
 
 def periodic_auto_route_worker(stop_event: threading.Event):
-    """Periodically re-evaluates closest Middle Pi for all nodes in AUTO mode."""
     while not stop_event.is_set():
         stop_event.wait(AUTO_CHECK_INTERVAL_S)
         if stop_event.is_set():
@@ -171,6 +165,103 @@ def periodic_auto_route_worker(stop_event: threading.Event):
             for mod_id in sorted(all_mods):
                 if room_assignments.get(mod_id, {}).get("mode", "auto") == "auto":
                     evaluate_ble_routing_locked(mod_id, now, force_recheck=False, source_tag="TIMER")
+
+
+def compute_move_recommendations_locked(middles_out: dict[str, dict]) -> dict[str, dict]:
+    """
+    Combines thermal/emotion comfort matching (Cell 10) and conflict outlier escalation (Cell 11)
+    across all connected rooms to recommend target rooms for stressed/conflicting participants.
+    """
+    recommendations: dict[str, dict] = {}
+    if len(middles_out) < 2:
+        return recommendations
+
+    # Map each room's temperature, focus emotion, and crowdedness
+    room_temp_map: dict[str, float] = {}
+    room_focus_emotion: dict[str, str] = {}
+    room_crowd_map: dict[str, float] = {}
+
+    for mid, m_val in middles_out.items():
+        ctx = m_val.get("context_analysis") or {}
+        room_temp_map[mid] = float(m_val.get("rm_temp_c", TEMP_THRESHOLD_C))
+        room_crowd_map[mid] = float(ctx.get("crowdedness", 0.0))
+
+        ew_vec = (ctx.get("strategy_vectors") or {}).get("Equality With Weight", [0.0, 0.0, 0.0])
+        if sum(ew_vec[:3]) > 0:
+            max_idx = ew_vec[:3].index(max(ew_vec[:3]))
+            room_focus_emotion[mid] = EMOTION_NAMES[max_idx]
+
+    for mid, m_val in sorted(middles_out.items()):
+        ctx = m_val.get("context_analysis") or {}
+        conflict_detected = bool(ctx.get("conflict_detected", False))
+        conflict_outlier = ctx.get("conflict_outlier")
+        current_temp = room_temp_map[mid]
+        bottom_nodes = m_val.get("bottom_nodes") or {}
+
+        for mod_id, b_info in sorted(bottom_nodes.items()):
+            r = b_info.get("latest_reading") or {}
+            norm_vec = r.get("norm_vec")
+            body_temp = r.get("mean_temp_c")
+
+            active_emotions = []
+            if isinstance(norm_vec, list) and len(norm_vec) >= 3:
+                active_emotions = [
+                    EMOTION_NAMES[i]
+                    for i in range(3)
+                    if float(norm_vec[i]) >= 1.0
+                ]
+
+            comfort = None
+            if body_temp is not None:
+                comfort = "Heat-Sensitive" if float(body_temp) >= BODY_TEMP_THRESHOLD_C else "Cold-Sensitive"
+
+            # 1. Thermal + Emotion matching when conflict/low cos_sim is present
+            thermal_mismatch = (
+                (comfort == "Heat-Sensitive" and current_temp >= TEMP_THRESHOLD_C)
+                or (comfort == "Cold-Sensitive" and current_temp < TEMP_THRESHOLD_C)
+            )
+
+            best_target = None
+            reason_parts = []
+
+            if conflict_detected and thermal_mismatch and active_emotions:
+                for alt_mid, alt_temp in sorted(room_temp_map.items()):
+                    if alt_mid == mid:
+                        continue
+                    temp_ok = (alt_temp < TEMP_THRESHOLD_C) if comfort == "Heat-Sensitive" else (alt_temp >= TEMP_THRESHOLD_C)
+                    if temp_ok:
+                        alt_emo = room_focus_emotion.get(alt_mid)
+                        if alt_emo and alt_emo in active_emotions:
+                            best_target = alt_mid
+                            reason_parts.append(
+                                f"{comfort} & {', '.join(active_emotions)} -> {alt_mid} ({alt_temp}°C, {alt_emo} focus)"
+                            )
+                            break
+                        elif best_target is None:
+                            best_target = alt_mid
+                            reason_parts.append(
+                                f"{comfort} ({', '.join(active_emotions)}) -> {alt_mid} ({alt_temp}°C)"
+                            )
+
+            # 2. Explicit Conflict Outlier trigger (Fairness target when cos_sim < 0.95)
+            if best_target is None and conflict_detected and conflict_outlier == mod_id:
+                alt_candidates = [m for m in sorted(middles_out.keys()) if m != mid]
+                if alt_candidates:
+                    best_target = min(alt_candidates, key=lambda m: room_crowd_map.get(m, 0.0))
+                    reason_parts.append(
+                        f"Conflict Outlier (Fairness priority) -> {best_target} ({room_temp_map[best_target]}°C)"
+                    )
+
+            if best_target:
+                recommendations[mod_id] = {
+                    "from_mid": mid,
+                    "to_mid": best_target,
+                    "comfort": comfort,
+                    "active_emotions": active_emotions,
+                    "reason": "; ".join(reason_parts),
+                }
+
+    return recommendations
 
 
 def build_global_snapshot_locked() -> dict:
@@ -201,11 +292,15 @@ def build_global_snapshot_locked() -> dict:
             "ip": info["ip"],
             "port": info.get("port", 8001),
             "last_seen_ago_s": round(now - info["last_seen"], 1),
+            "rm_temp_c": pkt.get("rm_temp_c", TEMP_THRESHOLD_C),
             "active_bottom_count": pkt.get("active_bottom_count", 0),
             "active_module_ids": pkt.get("active_module_ids", []),
             "group_summary": pkt.get("group_summary", {}),
+            "context_analysis": pkt.get("context_analysis", {}),
             "bottom_nodes": pkt.get("bottom_nodes", {}),
         }
+
+    move_recommendations = compute_move_recommendations_locked(middles_out)
 
     ble_live = {}
     for mod_id, per_mid in sorted(ble_observations.items()):
@@ -229,6 +324,7 @@ def build_global_snapshot_locked() -> dict:
         "total_active_bottom_count": total_bottom_active,
         "room_assignments": room_assignments,
         "ble_rssi": ble_live,
+        "move_recommendations": move_recommendations,
         "global_summary": {
             "mean_eda_peaks_2min": avg(all_eda),
             "mean_bpm": avg(all_bpm),
@@ -244,33 +340,58 @@ def render_rooms_html() -> str:
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Vital Cluster — Dynamic Room Router</title>
+  <title>Vital Cluster — Dynamic Room Router & Context Control</title>
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 920px; margin: 28px auto; padding: 0 16px; background: #111827; color: #f3f4f6; }
+    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 1120px; margin: 24px auto; padding: 0 16px; background: #111827; color: #f3f4f6; }
     h1 { font-size: 20px; margin-bottom: 6px; }
+    h2 { font-size: 16px; margin: 24px 0 10px 0; color: #e5e7eb; }
     p.sub { color: #9ca3af; font-size: 13px; margin-top: 0; }
-    table { width: 100%; border-collapse: collapse; margin-top: 16px; background: #1f2937; border-radius: 8px; overflow: hidden; }
-    th, td { padding: 10px 12px; border-bottom: 1px solid #374151; text-align: left; font-size: 14px; }
-    th { background: #111827; color: #9ca3af; font-weight: 600; }
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; background: #1f2937; border-radius: 8px; overflow: hidden; }
+    th, td { padding: 10px 12px; border-bottom: 1px solid #374151; text-align: left; font-size: 13px; vertical-align: middle; }
+    th { background: #0f172a; color: #9ca3af; font-weight: 600; }
     button { background: #2563eb; color: #fff; border: none; padding: 6px 10px; border-radius: 6px; cursor: pointer; margin-right: 4px; font-size: 12px; }
     button.auto { background: #059669; }
     button.check { background: #7c3aed; margin-left: 8px; }
+    button.move-btn { background: #d97706; font-weight: 600; margin-top: 4px; }
     button.active { outline: 2px solid #fbbf24; font-weight: 700; }
-    .badge { padding: 2px 7px; border-radius: 999px; font-size: 11px; background: #374151; }
+    .badge { padding: 2px 8px; border-radius: 999px; font-size: 11px; background: #374151; display: inline-block; }
+    .badge-ok { background: #065f46; color: #a7f3d0; }
+    .badge-warn { background: #991b1b; color: #fecaca; font-weight: 700; }
     .rssi { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px; color: #93c5fd; }
+    .mono { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; margin-top: 10px; }
+    .card { background: #1f2937; border: 1px solid #374151; border-radius: 8px; padding: 14px; }
+    .card-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; border-bottom: 1px solid #374151; padding-bottom: 8px; }
+    .kv { display: flex; justify-content: space-between; font-size: 12px; margin: 5px 0; color: #d1d5db; }
+    .kv span.lbl { color: #9ca3af; }
   </style>
 </head>
 <body>
-  <h1>Dynamic Room Router (Hybrid BLE Timer + Manual Override)</h1>
+  <h1>Dynamic Room Router & Context Control</h1>
   <p class="sub">
     Timer automatically checks closest room every <span id="interval">15</span>s when in <b>AUTO (BLE)</b> mode.
     <button class="check" onclick="recheckAll()">Check Closest Now</button>
   </p>
   <div id="middles"></div>
+
   <table>
-    <thead><tr><th>Participant (MOD)</th><th>Assigned Room</th><th>Mode</th><th>Live BLE Signal (Higher = Closer)</th><th>Switch Room</th></tr></thead>
+    <thead>
+      <tr>
+        <th>Participant (MOD)</th>
+        <th>Assigned Room</th>
+        <th>Mode</th>
+        <th>Live BLE Signal</th>
+        <th>Adaptability / Priority</th>
+        <th>Movement Recommendation</th>
+        <th>Switch Room</th>
+      </tr>
+    </thead>
     <tbody id="rows"></tbody>
   </table>
+
+  <h2>Room Context Vectors, Cosine Similarity & Device Settings</h2>
+  <div class="cards" id="room-cards"></div>
+
   <script>
     async function assign(modId, midId, mode) {
       await fetch('/api/assign', {
@@ -283,6 +404,9 @@ def render_rooms_html() -> str:
     async function recheckAll() {
       await fetch('/api/recheck', { method: 'POST' });
       refresh();
+    }
+    function fmtSim(v) {
+      return (v === null || v === undefined) ? '-' : Number(v).toFixed(4);
     }
     async function refresh() {
       const res = await fetch('/api/status');
@@ -302,11 +426,22 @@ def render_rooms_html() -> str:
       }).join('');
 
       const mods = new Set(Object.keys(data.room_assignments || {}));
-      for (const m of Object.values(data.middle_nodes)) {
-        (m.active_module_ids || []).forEach(id => mods.add(id));
+      const latestByMod = {};
+      const priorityByMod = {};
+      for (const [mKey, mVal] of Object.entries(data.middle_nodes || {})) {
+        (mVal.active_module_ids || []).forEach(id => mods.add(id));
+        const bNodes = mVal.bottom_nodes || {};
+        for (const [bId, bInfo] of Object.entries(bNodes)) {
+          if (bInfo.latest_reading) latestByMod[bId] = bInfo.latest_reading;
+        }
+        const pMap = ((mVal.context_analysis || {}).priority_weights) || {};
+        for (const [pId, pVal] of Object.entries(pMap)) {
+          priorityByMod[pId] = pVal;
+        }
       }
-      if (mods.size === 0) { mods.add('MOD-01'); mods.add('MOD-02'); }
+      if (mods.size === 0) { mods.add('MOD-01'); mods.add('MOD-02'); mods.add('MOD-03'); }
 
+      const recs = data.move_recommendations || {};
       const tbody = document.getElementById('rows');
       tbody.innerHTML = Array.from(mods).sort().map(mod => {
         const cur = (data.room_assignments || {})[mod] || {mid_id: 'MID-01', mode: 'auto'};
@@ -316,11 +451,63 @@ def render_rooms_html() -> str:
           ? rssiKeys.map(k => `${k}: ${rssiMap[k].rssi} dBm`).join(' | ')
           : 'No BLE beacon detected yet';
 
+        const rData = latestByMod[mod];
+        let statText = '<span style="color:#9ca3af;">Waiting for capture...</span>';
+        if (rData) {
+          const sc = (rData.adaptability_score !== undefined) ? rData.adaptability_score : '-';
+          const pr = (priorityByMod[mod] !== undefined) ? priorityByMod[mod] : '-';
+          const nv = Array.isArray(rData.norm_vec) ? `[${rData.norm_vec.join(', ')}]` : '-';
+          statText = `<div class="mono">Score: ${sc} | Pri: ${pr}</div><div class="mono" style="color:#9ca3af;">Z: ${nv}</div>`;
+        }
+
+        const rec = recs[mod];
+        let recHtml = '<span class="badge badge-ok">Steady (No move)</span>';
+        if (rec) {
+          recHtml = `<div style="color:#fbbf24;font-weight:600;">Move → ${rec.to_mid}</div>`
+            + `<div style="font-size:11px;color:#d1d5db;">${rec.reason}</div>`
+            + `<button class="move-btn" onclick="assign('${mod}','${rec.to_mid}','manual')">Apply Move</button>`;
+        }
+
         const btns = mids.map(m => {
           const cls = (cur.mid_id === m && cur.mode === 'manual') ? 'active' : '';
           return `<button class="${cls}" onclick="assign('${mod}','${m}','manual')">${m}</button>`;
         }).join('') + `<button class="auto ${cur.mode === 'auto' ? 'active' : ''}" onclick="assign('${mod}','${cur.mid_id}','auto')">AUTO (BLE)</button>`;
-        return `<tr><td><b>${mod}</b></td><td>${cur.mid_id}</td><td><span class="badge">${cur.mode}</span></td><td class="rssi">${rssiText}</td><td>${btns}</td></tr>`;
+
+        return `<tr>
+          <td><b>${mod}</b></td>
+          <td>${cur.mid_id}</td>
+          <td><span class="badge">${cur.mode}</span></td>
+          <td class="rssi">${rssiText}</td>
+          <td>${statText}</td>
+          <td>${recHtml}</td>
+          <td>${btns}</td>
+        </tr>`;
+      }).join('');
+
+      const cardsDiv = document.getElementById('room-cards');
+      cardsDiv.innerHTML = mids.map(m => {
+        const info = data.middle_nodes[m];
+        if (!info) {
+          return `<div class="card"><div class="card-head"><b>${m}</b><span class="badge">offline</span></div><div style="color:#9ca3af;font-size:12px;">Waiting for Middle Pi heartbeat...</div></div>`;
+        }
+        const ctx = info.context_analysis || {};
+        const ctrl = ctx.room_control || {};
+        const cos = ctx.cosine_similarity || {};
+        const sVecs = ctx.strategy_vectors || {};
+        const ewVec = sVecs['Equality With Weight'] || [0, 0, 0, 0];
+        const statusBadge = ctx.conflict_detected
+          ? `<span class="badge badge-warn">CONFLICT DETECTED (${ctx.conflict_outlier || '-'})</span>`
+          : `<span class="badge badge-ok">STEADY STATE</span>`;
+
+        return `<div class="card">
+          <div class="card-head"><b>${m} (${info.ip})</b>${statusBadge}</div>
+          <div class="kv"><span class="lbl">Room Temp / Crowdedness</span><span class="mono">${info.rm_temp_c}°C / ${ctx.crowdedness ?? 0}</span></div>
+          <div class="kv"><span class="lbl">AC Target / Device Setting</span><span class="mono"><b>${ctrl.ac_target_temp_c ?? '-'}°C</b> / <b>${ctrl.device_setting ?? 'Random'}</b></span></div>
+          <div class="kv"><span class="lbl">Group Context (Eq+Wt)</span><span class="mono">[${ewVec.join(', ')}]</span></div>
+          <div class="kv"><span class="lbl">CosSim (Equality)</span><span class="mono">${fmtSim(cos['Equality'])}</span></div>
+          <div class="kv"><span class="lbl">CosSim (Eq With Weight)</span><span class="mono">${fmtSim(cos['Equality With Weight'])}</span></div>
+          <div class="kv"><span class="lbl">CosSim (Fairness)</span><span class="mono">${fmtSim(cos['Fairness'])}</span></div>
+        </div>`;
       }).join('');
     }
     refresh();
@@ -419,7 +606,7 @@ class TopHandler(BaseHTTPRequestHandler):
 
         if self.path == "/api/ble_scan":
             mid_id = str(payload.get("middle_id", "")).strip().upper()
-            readings = payload.get("readings", {})  # {"MOD-01": -58, ...}
+            readings = payload.get("readings", {})
             if not mid_id or not isinstance(readings, dict):
                 self._send_json(400, {"error": "Invalid ble_scan payload"})
                 return
@@ -488,12 +675,13 @@ class TopHandler(BaseHTTPRequestHandler):
             print(f"[{TOP_ID}] UPDATE from {mid} (trigger: {payload.get('trigger_module')})")
             for m_key, m_val in snapshot["middle_nodes"].items():
                 gs = m_val["group_summary"]
+                ctx = m_val.get("context_analysis") or {}
                 print(
-                    f"  • {m_key}: {m_val['active_bottom_count']} bottom Pis {m_val['active_module_ids']} "
-                    f"| Avg EDA={gs.get('mean_eda_peaks_2min')}, BPM={gs.get('mean_bpm')}, "
-                    f"Resp={gs.get('mean_resp_rate_min')}, Temp={gs.get('mean_temp_c')}°C"
+                    f"  • {m_key} (RmTemp={m_val['rm_temp_c']}°C): {m_val['active_bottom_count']} bottom Pis {m_val['active_module_ids']} "
+                    f"| Ctrl={ctx.get('room_control')} | Conflict={ctx.get('conflict_detected')}"
                 )
-            print(f"  => GLOBAL ({snapshot['total_active_bottom_count']} active Pis): {snapshot['global_summary']}")
+            if snapshot["move_recommendations"]:
+                print(f"  => MOVE RECOMMENDATIONS: {snapshot['move_recommendations']}")
             print("=" * 60 + "\n")
 
         self._send_json(200, {"ok": True, "top_id": TOP_ID})
