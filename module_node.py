@@ -89,6 +89,25 @@ def get_capture_state() -> tuple[bool, float, bool]:
         return is_recording, elapsed, is_sim_mode
 
 
+def reset_local_data():
+    """Clears all saved CSV/JSON session files and resets in-memory baseline history."""
+    global latest_payload_cache
+    with metrics_lock:
+        history_buffer.clear()
+        latest_payload_cache = None
+    if OUT_DIR.exists():
+        for item in OUT_DIR.iterdir():
+            try:
+                if item.is_dir():
+                    shutil.rmtree(item)
+                else:
+                    item.unlink()
+            except OSError:
+                pass
+    OUT_DIR.mkdir(exist_ok=True)
+    print(f"[{MODULE_ID}] All local experiment data & baseline history cleared.")
+
+
 # --- PURE-PYTHON STATISTICAL HELPERS (No numpy/scipy required) ---
 def percentile_25(values: list[float]) -> float:
     s = sorted(values)
@@ -266,7 +285,6 @@ def get_json(url: str, timeout: float = 3.0) -> dict | None:
 
 
 def sync_dynamic_route():
-    """Queries Top Pi for current room assignment; detaches cleanly from old room if changed."""
     global current_mid_id, current_middle_url
     top_url = get_top_url()
     if not top_url:
@@ -311,7 +329,6 @@ def sync_dynamic_route():
 
 
 def start_ble_beacon():
-    """Enables persistent BLE advertising with Local Name = MODULE_ID."""
     global _bt_proc
     if shutil.which("rfkill"):
         try:
@@ -418,7 +435,6 @@ def trigger_immediate_heartbeat():
 
 
 def heartbeat_worker(stop_event: threading.Event):
-    """Syncs room assignment from Top Pi and registers heartbeat (with live capture state) on Middle Pi."""
     while not stop_event.is_set():
         sync_dynamic_route()
         send_heartbeat_once()
@@ -523,7 +539,7 @@ def run_respiration_tracker(stop_event: threading.Event, result_container: dict,
 class SimulatedMicrobit:
     """Emulates micro:bit serial output (5 Hz GSR, BPM, Temp) with keyboard and HTTP triggers."""
 
-    def __init__(self, control_port: int = SIM_CONTROL_PORT):
+    def __init__(self):
         self.boot_t = time.time()
         self.recording = False
         self.rec_start_t = 0.0
@@ -532,9 +548,7 @@ class SimulatedMicrobit:
         self.base_gsr = random.randint(610, 670)
         self.base_bpm = random.randint(68, 82)
         self.base_temp_adc = random.randint(512, 535)
-
         self._start_keyboard_listener()
-        self._start_http_trigger(control_port)
 
     def trigger_start(self):
         with self.lock:
@@ -572,37 +586,6 @@ class SimulatedMicrobit:
 
         threading.Thread(target=_watch_stdin, daemon=True).start()
 
-    def _start_http_trigger(self, port: int):
-        sim_ref = self
-
-        class SimControlHandler(BaseHTTPRequestHandler):
-            def do_POST(self):
-                if self.path == "/start":
-                    sim_ref.trigger_start()
-                    self._reply(200, {"status": "started", "module_id": MODULE_ID})
-                elif self.path == "/stop":
-                    sim_ref.trigger_stop()
-                    self._reply(200, {"status": "stopped", "module_id": MODULE_ID})
-                else:
-                    self._reply(404, {"error": "Use POST /start or POST /stop"})
-
-            def _reply(self, code: int, body: dict):
-                raw = json.dumps(body).encode("utf-8")
-                self.send_response(code)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(raw)))
-                self.end_headers()
-                self.wfile.write(raw)
-
-            def log_message(self, format, *args):
-                return
-
-        try:
-            server = HTTPServer(("0.0.0.0", port), SimControlHandler)
-            threading.Thread(target=server.serve_forever, daemon=True).start()
-        except OSError as exc:
-            print(f"[{MODULE_ID}] Note: HTTP sim trigger port {port} unavailable ({exc})")
-
     def readline(self) -> str:
         with self.lock:
             if self.pending_cmd:
@@ -629,6 +612,48 @@ class SimulatedMicrobit:
         bpm = max(55, min(115, self.base_bpm + int(4 * math.sin(elapsed / 9.0)) + random.randint(-2, 2)))
         temp_raw = self.base_temp_adc + random.randint(-1, 1)
         return f"{mb_ms},{gsr},{bpm},{temp_raw}"
+
+
+def start_control_http_server(port: int, sim_ref: SimulatedMicrobit | None = None):
+    """Always-on HTTP control server for /reset (all modes) and /start, /stop (sim mode)."""
+
+    class NodeControlHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            if self.path == "/reset":
+                reset_local_data()
+                trigger_immediate_heartbeat()
+                self._reply(200, {"ok": True, "module_id": MODULE_ID})
+            elif self.path == "/start":
+                if sim_ref is None:
+                    self._reply(400, {"error": "Hardware micro:bit attached; press Button A to start"})
+                else:
+                    sim_ref.trigger_start()
+                    self._reply(200, {"status": "started", "module_id": MODULE_ID})
+            elif self.path == "/stop":
+                if sim_ref is None:
+                    self._reply(400, {"error": "Hardware micro:bit attached; press Button B to stop"})
+                else:
+                    sim_ref.trigger_stop()
+                    self._reply(200, {"status": "stopped", "module_id": MODULE_ID})
+            else:
+                self._reply(404, {"error": "Use POST /reset, /start, or /stop"})
+
+        def _reply(self, code: int, body: dict):
+            raw = json.dumps(body).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def log_message(self, format, *args):
+            return
+
+    try:
+        server = HTTPServer(("0.0.0.0", port), NodeControlHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    except OSError as exc:
+        print(f"[{MODULE_ID}] Note: HTTP control port {port} unavailable ({exc})")
 
 
 def find_port() -> str | None:
@@ -694,6 +719,7 @@ def finalize_session(rows: list[tuple], resp_result: dict, wall_duration_s: floa
     if middle_url:
         sent_ok = post_json(f"{middle_url}/api/bottom", payload)
         if not sent_ok:
+            OUT_DIR.mkdir(exist_ok=True)
             with open(QUEUE_FILE, "a", encoding="utf-8") as qf:
                 qf.write(json.dumps(payload) + "\n")
 
@@ -708,6 +734,7 @@ def finalize_session(rows: list[tuple], resp_result: dict, wall_duration_s: floa
     print(f"  -> Middle Pi ({mid_id} @ {middle_url or 'UNSET'}): {'SENT' if sent_ok else 'QUEUED/LOCAL'}")
     print("=" * 56 + "\n")
 
+    OUT_DIR.mkdir(exist_ok=True)
     summary_path = OUT_DIR / f"{MODULE_ID}_summary.csv"
     write_header = not summary_path.exists()
     with open(summary_path, "a", newline="") as sf:
@@ -753,6 +780,7 @@ def run_capture_loop(read_line_fn, sim_mode: bool, hb_stop: threading.Event):
             if line == "#START":
                 if f:
                     f.close()
+                OUT_DIR.mkdir(exist_ok=True)
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                 raw_path = OUT_DIR / f"{MODULE_ID}_raw_{ts}.csv"
 
@@ -843,6 +871,7 @@ def main():
 
     mid_id, middle_url = get_active_route()
     if port:
+        start_control_http_server(SIM_CONTROL_PORT, sim_ref=None)
         print(f"[{MODULE_ID}] Connected to {port} @ {BAUD} baud.")
         print(f"[{MODULE_ID}] Top Pi Directory: {get_top_url() or 'Unset'} | Active Room: {mid_id} ({middle_url or 'Unset'})")
         print("Press Button A on the micro:bit to start a 2-minute capture...")
@@ -854,10 +883,11 @@ def main():
                 hb_stop=hb_stop,
             )
     else:
+        sim = SimulatedMicrobit()
+        start_control_http_server(SIM_CONTROL_PORT, sim_ref=sim)
         print(f"[{MODULE_ID}] no microbit — switching to simulation sensors")
         print(f"[{MODULE_ID}] Top Pi Directory: {get_top_url() or 'Unset'} | Active Room: {mid_id} ({middle_url or 'Unset'})")
         print(f"[{MODULE_ID}] Press Enter (or POST http://<PI-IP>:{SIM_CONTROL_PORT}/start & /stop) to toggle capture...")
-        sim = SimulatedMicrobit(SIM_CONTROL_PORT)
         run_capture_loop(sim.readline, sim_mode=True, hb_stop=hb_stop)
 
 

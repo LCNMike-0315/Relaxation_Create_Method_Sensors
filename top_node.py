@@ -9,9 +9,12 @@ import io
 import json
 import os
 import re
+import shutil
 import socket
 import threading
 import time
+import urllib.error
+import urllib.request
 import zipfile
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -96,6 +99,23 @@ ble_observations: dict[str, dict[str, dict]] = {}
 prev_recording_state: dict[str, bool] = {}
 last_room_signature: dict[str, str] = {}
 last_logged_recommendations: dict[str, tuple[str, str]] = {}
+
+
+def post_json_resp(url: str, payload: dict, timeout: float = 4.0) -> dict | None:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if 200 <= resp.status < 300:
+                return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        pass
+    return None
 
 
 def append_csv_row_locked(path: Path, header: list[str], row: list):
@@ -495,11 +515,74 @@ def build_global_snapshot_locked() -> dict:
     }
 
 
+def reset_all_cluster_data() -> dict:
+    """Wipes all experiment data across Top, Middle, and Bottom Pis while preserving connections."""
+    with state_lock:
+        for info in middle_states.values():
+            pkt = info.get("packet") or {}
+            for b_info in (pkt.get("bottom_nodes") or {}).values():
+                if b_info.get("is_recording"):
+                    return {
+                        "ok": False,
+                        "error": "Cannot initialize while a node is recording. Wait for capture to finish first.",
+                    }
+        middles_snapshot = {
+            mid: (info["ip"], info.get("port", 8001))
+            for mid, info in middle_states.items()
+        }
+
+    cleared_middles = []
+    cleared_bottoms = []
+    for mid, (m_ip, m_port) in sorted(middles_snapshot.items()):
+        resp = post_json_resp(f"http://{m_ip}:{m_port}/api/reset", {}, timeout=4.0)
+        if resp and resp.get("ok"):
+            cleared_middles.append(mid)
+            cleared_bottoms.extend(resp.get("cleared_bottoms", []))
+
+    with state_lock:
+        prev_recording_state.clear()
+        last_room_signature.clear()
+        last_logged_recommendations.clear()
+
+        for info in middle_states.values():
+            pkt = info.get("packet")
+            if isinstance(pkt, dict):
+                pkt["reporting_bottom_count"] = 0
+                for b_info in (pkt.get("bottom_nodes") or {}).values():
+                    if isinstance(b_info, dict):
+                        b_info["latest_reading"] = None
+
+        if OUT_DIR.exists():
+            for item in OUT_DIR.iterdir():
+                try:
+                    if item.is_dir():
+                        shutil.rmtree(item)
+                    else:
+                        item.unlink()
+                except OSError:
+                    pass
+        OUT_DIR.mkdir(exist_ok=True)
+        RAW_SESSIONS_DIR.mkdir(exist_ok=True)
+        save_assignments_locked()
+
+        snapshot = build_global_snapshot_locked()
+        LATEST_JSON.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+
+    print(f"[{TOP_ID}] INITIALIZED: Cleared all experiment data (Middles={cleared_middles}, Bottoms={sorted(set(cleared_bottoms))})")
+    return {
+        "ok": True,
+        "cleared_middles": cleared_middles,
+        "cleared_bottoms": sorted(set(cleared_bottoms)),
+    }
+
+
 def record_experiment_logs_locked(mid: str, event_type: str, payload: dict, snapshot: dict, now: float):
+    if event_type == "reset":
+        return
+
     ts_iso = datetime.now().isoformat(timespec="seconds")
     OUT_DIR.mkdir(exist_ok=True)
 
-    # 1. Raw JSONL stream (preserves 100% of every incoming packet)
     with open(RAW_PACKETS_JSONL, "a", encoding="utf-8") as jf:
         jf.write(json.dumps({"received_at": ts_iso, "middle_id": mid, "packet": payload}) + "\n")
 
@@ -512,7 +595,6 @@ def record_experiment_logs_locked(mid: str, event_type: str, payload: dict, snap
     gs = payload.get("group_summary") or {}
     recs = snapshot.get("move_recommendations") or {}
 
-    # 2. Capture start/stop transitions
     for b_id, b_info in (m_val.get("bottom_nodes") or {}).items():
         is_rec = bool(b_info.get("is_recording", False))
         was_rec = prev_recording_state.get(b_id, False)
@@ -532,7 +614,6 @@ def record_experiment_logs_locked(mid: str, event_type: str, payload: dict, snap
             )
             prev_recording_state[b_id] = is_rec
 
-    # 3. Room context log (on meaningful events or state changes)
     sig = json.dumps({
         "rm_temp_c": m_val.get("rm_temp_c"),
         "active": m_val.get("active_module_ids"),
@@ -576,7 +657,6 @@ def record_experiment_logs_locked(mid: str, event_type: str, payload: dict, snap
             ],
         )
 
-    # 4. Log new or changed movement recommendations
     for mod_id, rec in recs.items():
         rec_sig = (rec.get("to_mid", ""), rec.get("reason", ""))
         if last_logged_recommendations.get(mod_id) != rec_sig:
@@ -593,7 +673,6 @@ def record_experiment_logs_locked(mid: str, event_type: str, payload: dict, snap
                 rec.get("reason", ""),
             )
 
-    # 5. Completed 2-minute session records (master + flattened per-participant table)
     if event_type == "reading":
         append_csv_row_locked(
             MASTER_CSV,
@@ -697,6 +776,8 @@ def render_rooms_html() -> str:
     button.auto { background: #059669; }
     button.check { background: #7c3aed; margin-left: 8px; }
     a.export-btn { background: #0d9488; font-weight: 600; margin-left: 4px; }
+    button.reset-btn { background: #dc2626; font-weight: 700; margin-left: 4px; }
+    button.reset-btn:hover { background: #b91c1c; }
     button.move-btn { background: #d97706; font-weight: 600; margin-top: 4px; }
     button.active { outline: 2px solid #fbbf24; font-weight: 700; }
     table { width: 100%; border-collapse: collapse; margin-top: 12px; background: #1f2937; border-radius: 8px; overflow: hidden; }
@@ -730,6 +811,7 @@ def render_rooms_html() -> str:
     Timer automatically checks closest room every <span id="interval">15</span>s when in <b>AUTO (BLE)</b> mode.
     <button class="check" onclick="recheckAll()">Check Closest Now</button>
     <a class="btn export-btn" href="/api/export.zip">Download All Experiment Data (.ZIP)</a>
+    <button class="reset-btn" onclick="initializeAllData()">Initialize (Clear All Data)</button>
   </p>
   <div id="middles"></div>
 
@@ -767,6 +849,36 @@ def render_rooms_html() -> str:
     }
     async function recheckAll() {
       await fetch('/api/recheck', { method: 'POST' });
+      refresh();
+    }
+    async function initializeAllData() {
+      const firstOk = confirm(
+        "Step 1 of 2: Delete ALL recorded experiment data (CSV logs, raw 5Hz files, baseline histories, and dashboard metrics) across TOP, MIDDLE, and BOTTOM Pis?"
+      );
+      if (!firstOk) return;
+
+      const secondOk = confirm(
+        "Step 2 of 2 (FINAL CONFIRMATION): Are you sure you want to permanently wipe all old test data before starting the experiment? This cannot be undone."
+      );
+      if (!secondOk) return;
+
+      const res = await fetch('/api/reset', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ confirmed: true })
+      });
+      const out = await res.json();
+      if (!out.ok) {
+        alert("Initialize aborted: " + (out.error || "Unknown error"));
+        return;
+      }
+      alert(
+        "Initialized successfully! Cleared data on TOP-01, Middles: [" +
+        (out.cleared_middles || []).join(", ") +
+        "], Bottoms: [" +
+        (out.cleared_bottoms || []).join(", ") +
+        "]."
+      );
       refresh();
     }
     function fmtSim(v) {
@@ -1021,6 +1133,12 @@ class TopHandler(BaseHTTPRequestHandler):
 
         client_ip = self.client_address[0]
         now = time.time()
+
+        if self.path == "/api/reset":
+            res = reset_all_cluster_data()
+            code = 200 if res.get("ok") else 409
+            self._send_json(code, res)
+            return
 
         if self.path == "/api/raw_session":
             mod_id = str(payload.get("mod_id", "UNKNOWN")).strip().upper()

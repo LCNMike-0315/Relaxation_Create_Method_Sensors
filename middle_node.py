@@ -10,6 +10,7 @@ import csv
 import json
 import math
 import os
+import shutil
 import socket
 import threading
 import time
@@ -22,6 +23,7 @@ from pathlib import Path
 # --- CONFIGURATION ---
 MIDDLE_ID = os.getenv("MIDDLE_ID") or socket.gethostname().upper()
 LISTEN_PORT = int(os.getenv("MIDDLE_PORT", "8001"))
+BOTTOM_CONTROL_PORT = int(os.getenv("SIM_CONTROL_PORT", "8002"))
 TOP_URL_FILE = Path("top_url.txt")
 OUT_DIR = Path("data")
 ACTIVE_TIMEOUT_S = 40.0     # Bottom Pi removed from active list if silent > 40s
@@ -35,7 +37,6 @@ EMOTION_CONTROL_THRESHOLD = 0.8
 TEMP_THRESHOLD_C = 23.0
 ROOM_CAPACITY = 10.0
 
-# Fixed fallback room temperature until physical sensor is attached to mid-01/02/03
 DEFAULT_RM_TEMP_C = float(os.getenv("RM_TEMP", "23.0"))
 
 RECEIVED_HEADER = [
@@ -45,22 +46,10 @@ RECEIVED_HEADER = [
 ]
 
 state_lock = threading.Lock()
-# active_nodes[module_id] = {"last_seen": float, "ip": str, "is_recording": bool, "recording_elapsed_s": float, "sim_mode": bool, "latest_reading": dict | None}
 active_nodes: dict[str, dict] = {}
 
 
 def read_room_temperature() -> float:
-    """
-    Returns current room temperature (°C).
-    When adding a physical temperature sensor (e.g., BME280/SHT31) to mid-01/mid-02/mid-03,
-    implement the hardware read inside [HARDWARE SENSOR HOOK] below.
-    """
-    # --- [HARDWARE SENSOR HOOK] ---------------------------------
-    # try:
-    #     return round(read_physical_temp_sensor(), 2)
-    # except Exception:
-    #     pass
-    # ------------------------------------------------------------
     return round(DEFAULT_RM_TEMP_C, 2)
 
 
@@ -126,7 +115,6 @@ def compute_room_context_locked(rm_temp_c: float) -> dict:
         }
 
     n = len(ids_with_vecs)
-
     pri_equality = [1.0] * n
 
     total_score = sum(score_by_id[pid] for pid in ids_with_vecs)
@@ -283,6 +271,37 @@ def forward_to_top(packet: dict) -> bool:
     return post_json(f"{top_url}/api/middle", packet)
 
 
+def reset_middle_and_bottoms() -> dict:
+    """Clears Middle Pi received CSVs, resets cached readings, and triggers /reset on connected Bottom Pis."""
+    with state_lock:
+        bottom_targets = {mid: info["ip"] for mid, info in active_nodes.items()}
+        for info in active_nodes.values():
+            info["latest_reading"] = None
+
+    if OUT_DIR.exists():
+        for item in OUT_DIR.iterdir():
+            try:
+                if item.is_dir():
+                    shutil.rmtree(item)
+                else:
+                    item.unlink()
+            except OSError:
+                pass
+    OUT_DIR.mkdir(exist_ok=True)
+
+    cleared_bottoms = []
+    for mod_id, b_ip in sorted(bottom_targets.items()):
+        if post_json(f"http://{b_ip}:{BOTTOM_CONTROL_PORT}/reset", {}, timeout=2.5):
+            cleared_bottoms.append(mod_id)
+
+    with state_lock:
+        packet = build_group_packet_locked(event_type="reset")
+    forward_to_top(packet)
+
+    print(f"[{MIDDLE_ID}] Cleared local data and reset bottom nodes: {cleared_bottoms}")
+    return {"ok": True, "middle_id": MIDDLE_ID, "cleared_bottoms": cleared_bottoms}
+
+
 def periodic_top_sync(stop_event: threading.Event):
     while not stop_event.is_set():
         with state_lock:
@@ -292,7 +311,6 @@ def periodic_top_sync(stop_event: threading.Event):
 
 
 def ble_scanner_worker(stop_event: threading.Event):
-    """Scans nearby MOD-XX BLE advertisements and sends RSSI readings to Top Pi."""
     try:
         from bleak import BleakScanner  # type: ignore
     except ImportError:
@@ -357,13 +375,18 @@ class MiddleHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
         try:
-            data = json.loads(self.rfile.read(length).decode("utf-8"))
+            data = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else {}
         except json.JSONDecodeError:
             self._send_json(400, {"error": "Invalid JSON"})
             return
 
         client_ip = self.client_address[0]
         now = time.time()
+
+        if self.path == "/api/reset":
+            res = reset_middle_and_bottoms()
+            self._send_json(200, res)
+            return
 
         if self.path == "/api/heartbeat":
             mod_id = str(data.get("module_id", "")).strip().upper()
@@ -396,8 +419,7 @@ class MiddleHandler(BaseHTTPRequestHandler):
                     active_nodes[mod_id]["is_recording"] = rec_active
                     active_nodes[mod_id]["recording_elapsed_s"] = rec_elapsed
                     active_nodes[mod_id]["sim_mode"] = sim_flag
-                    if isinstance(hb_reading, dict):
-                        active_nodes[mod_id]["latest_reading"] = hb_reading
+                    active_nodes[mod_id]["latest_reading"] = hb_reading if isinstance(hb_reading, dict) else None
 
                 count = len(active_nodes)
                 if is_new or prev_rec != rec_active:
@@ -457,6 +479,7 @@ class MiddleHandler(BaseHTTPRequestHandler):
                     active_nodes[mod_id]["recording_elapsed_s"] = 0.0
                     active_nodes[mod_id]["latest_reading"] = data
 
+                OUT_DIR.mkdir(exist_ok=True)
                 csv_path = OUT_DIR / f"{MIDDLE_ID}_received.csv"
                 write_header = not csv_path.exists()
                 with open(csv_path, "a", newline="") as cf:
