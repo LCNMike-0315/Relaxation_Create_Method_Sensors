@@ -1,108 +1,110 @@
 #!/usr/bin/env python3
-# Top-Layer Raspberry Pi Coordinator (1 Top Pi <- 3 Middle Pis <- 0~10 Bottom Pis each)
-# Acts as Central Room Directory, Experiment Data Logger, and Live Dashboard (/rooms).
+# Top-Layer Cluster Coordinator & Dynamic Room Router (1 Top Pi <- 1~3 Middle Pis <- 0~10 Bottom Pis each)
+# Aggregates room context vectors, tracks BLE proximity across rooms, recommends participant moves
+# with a post-move cooldown filter (rounds + elapsed time), logs experiment CSVs, and serves /rooms UI.
 
 from __future__ import annotations
 
 import csv
 import io
 import json
+import math
 import os
-import re
-import shutil
 import socket
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
 
 # --- CONFIGURATION ---
 TOP_ID = os.getenv("TOP_ID") or socket.gethostname().upper()
 LISTEN_PORT = int(os.getenv("TOP_PORT", "8000"))
 OUT_DIR = Path("data")
-RAW_SESSIONS_DIR = OUT_DIR / "raw_sessions"
+EVENTS_CSV = OUT_DIR / f"{TOP_ID}_cluster_events.csv"
 
-MASTER_CSV = OUT_DIR / "TOP_master_readings.csv"
-RAW_PACKETS_JSONL = OUT_DIR / "TOP_raw_packets.jsonl"
-PARTICIPANT_SESSIONS_CSV = OUT_DIR / "TOP_participant_sessions.csv"
-ROOM_CONTEXT_CSV = OUT_DIR / "TOP_room_context_log.csv"
-ROUTING_LOG_CSV = OUT_DIR / "TOP_room_routing_log.csv"
-BLE_RSSI_CSV = OUT_DIR / "TOP_ble_rssi_log.csv"
-CAPTURE_EVENTS_CSV = OUT_DIR / "TOP_capture_events.csv"
+MIDDLE_STALE_S = float(os.getenv("MIDDLE_STALE_S", "30.0"))
+BOTTOM_STALE_S = float(os.getenv("BOTTOM_STALE_S", "30.0"))
+BLE_STALE_S = float(os.getenv("BLE_STALE_S", "20.0"))
+AUTO_BLE_INTERVAL_S = float(os.getenv("AUTO_BLE_INTERVAL_S", "15.0"))
+BLE_HYSTERESIS_DBM = float(os.getenv("BLE_HYSTERESIS_DBM", "4.0"))
 
-LATEST_JSON = OUT_DIR / "TOP_latest_state.json"
-ASSIGNMENTS_JSON = OUT_DIR / "TOP_room_assignments.json"
+# Post-move cooldown filter: suppress repeat move suggestions for N capture rounds or M seconds
+MOVE_COOLDOWN_ROUNDS = int(os.getenv("MOVE_COOLDOWN_ROUNDS", "3"))
+MOVE_COOLDOWN_S = float(os.getenv("MOVE_COOLDOWN_S", "1800"))  # 1800s = 30 min, 3600s = 60 min
 
-BLE_STALE_S = 20.0
-BLE_HYSTERESIS_DBM = float(os.getenv("BLE_HYSTERESIS_DBM", "3.0"))
-AUTO_CHECK_INTERVAL_S = float(os.getenv("AUTO_CHECK_INTERVAL_S", "15.0"))
-MIDDLE_STALE_S = float(os.getenv("MIDDLE_STALE_S", "35.0"))
+COSINE_CONFLICT_THRESHOLD = float(os.getenv("COSINE_CONFLICT_THRESHOLD", "0.95"))
+BODY_TEMP_THRESHOLD_C = float(os.getenv("BODY_TEMP_THRESHOLD_C", "36.0"))
 
-TEMP_THRESHOLD_C = 23.0
-BODY_TEMP_THRESHOLD_C = 36.0
-EMOTION_NAMES = ["Anxiety", "Displeasure", "Anger"]
-EMOTION_WEIGHTS = [0.4, 0.3, 0.2]
+EMOTION_LABELS = ["Anxiety", "Displeasure", "Anger"]
 
-MASTER_HEADER = [
-    "top_received_at", "middle_id", "trigger_module",
-    "active_bottom_count", "reporting_bottom_count",
-    "group_mean_eda", "group_mean_bpm", "group_mean_resp", "group_mean_temp_c",
-    "raw_json"
-]
 
-PARTICIPANT_SESSION_HEADER = [
-    "recorded_at", "middle_id", "trigger_module", "is_trigger_module", "mod_id",
-    "assigned_mode", "ble_rssi_current_room", "is_recording", "sim_mode",
-    "eda_peaks_2min", "mean_bpm", "resp_rate_min", "mean_temp_c",
-    "z_eda", "z_hr", "z_rr", "z_temp",
-    "adaptability_score", "priority_weight",
-    "thermal_comfort", "thermal_mismatch",
-    "stress_types", "dominant_stress", "is_conflict_outlier",
-    "room_temp_c", "crowdedness", "ac_target_temp_c", "device_setting",
-    "conflict_detected", "cos_sim_equality", "cos_sim_eq_weight", "cos_sim_fairness",
-    "move_recommended_to", "move_recommendation_reason"
-]
+class MoveCooldownTracker:
+    """Prevents recommending another room move right after a participant moves."""
 
-ROOM_CONTEXT_HEADER = [
-    "recorded_at", "event_type", "middle_id", "trigger_module",
-    "rm_temp_c", "crowdedness", "active_bottom_count", "reporting_bottom_count",
-    "active_module_ids", "recording_module_ids",
-    "group_mean_eda", "group_mean_bpm", "group_mean_resp", "group_mean_temp_c",
-    "vec_equality", "vec_eq_weight", "vec_fairness",
-    "cos_sim_equality", "cos_sim_eq_weight", "cos_sim_fairness",
-    "conflict_detected", "conflict_outlier",
-    "ac_target_temp_c", "device_setting"
-]
+    def __init__(self):
+        # mod_id -> {"from_room": str, "to_room": str, "moved_at": float, "rounds": int, "last_reading_ts": str}
+        self._state: dict[str, dict] = {}
 
-ROUTING_LOG_HEADER = [
-    "recorded_at", "event_type", "mod_id", "from_mid", "to_mid",
-    "mode", "source_tag", "rssi_mid01", "rssi_mid02", "rssi_mid03", "reason"
-]
+    def record_move(self, mod_id: str, old_room: str | None, new_room: str | None):
+        if not old_room or not new_room or old_room == "UNASSIGNED" or old_room == new_room:
+            return
+        self._state[mod_id] = {
+            "from_room": old_room,
+            "to_room": new_room,
+            "moved_at": time.time(),
+            "rounds": 0,
+            "last_reading_ts": "",
+        }
+        print(
+            f"[{TOP_ID}] Cooldown started for {mod_id}: moved {old_room} -> {new_room} "
+            f"(locked for {MOVE_COOLDOWN_ROUNDS} rounds or {int(MOVE_COOLDOWN_S // 60)}m)"
+        )
 
-BLE_RSSI_HEADER = [
-    "recorded_at", "mod_id", "scanner_mid_id", "rssi_dbm", "assigned_mid_id", "routing_mode"
-]
+    def record_capture_round(self, mod_id: str, reading_ts: str):
+        entry = self._state.get(mod_id)
+        if not entry or not reading_ts:
+            return
+        if reading_ts != entry["last_reading_ts"]:
+            entry["last_reading_ts"] = reading_ts
+            entry["rounds"] += 1
+            print(
+                f"[{TOP_ID}] Cooldown round progress for {mod_id}: "
+                f"{entry['rounds']}/{MOVE_COOLDOWN_ROUNDS}"
+            )
 
-CAPTURE_EVENTS_HEADER = [
-    "recorded_at", "mod_id", "middle_id", "event", "recording_elapsed_s", "sim_mode"
-]
+    def check(self, mod_id: str) -> tuple[bool, str]:
+        entry = self._state.get(mod_id)
+        if not entry:
+            return False, ""
+        elapsed_s = time.time() - entry["moved_at"]
+        rounds = entry["rounds"]
+        if rounds >= MOVE_COOLDOWN_ROUNDS or elapsed_s >= MOVE_COOLDOWN_S:
+            del self._state[mod_id]
+            return False, ""
+        rem_min = max(1, int((MOVE_COOLDOWN_S - elapsed_s + 59) // 60))
+        label = (
+            f"Cooldown: Moved -> {entry['to_room']} "
+            f"({rounds}/{MOVE_COOLDOWN_ROUNDS} rounds, {rem_min}m left)"
+        )
+        return True, label
+
+    def clear(self):
+        self._state.clear()
+
 
 state_lock = threading.Lock()
-middle_states: dict[str, dict] = {}
-room_assignments: dict[str, dict] = {}
-ble_observations: dict[str, dict[str, dict]] = {}
-latest_move_recommendations: dict[str, dict] = {}
-prev_recording_state: dict[str, bool] = {}
-last_room_signature: dict[str, str] = {}
-last_logged_recommendations: dict[str, tuple[str, str]] = {}
+middle_nodes: dict[str, dict] = {}
+participants: dict[str, dict] = {}
+ble_table: dict[str, dict[str, dict]] = {}  # mod_id -> mid_id -> {"rssi": float, "ts": float}
+move_cooldown = MoveCooldownTracker()
 
 
-def post_json_resp(url: str, payload: dict, timeout: float = 4.0) -> dict | None:
+def post_json(url: str, payload: dict, timeout: float = 3.0) -> bool:
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -112,744 +114,318 @@ def post_json_resp(url: str, payload: dict, timeout: float = 4.0) -> dict | None
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            if 200 <= resp.status < 300:
-                return json.loads(resp.read().decode("utf-8"))
-    except Exception:
-        pass
-    return None
+            return 200 <= resp.status < 300
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return False
 
 
-def append_csv_row_locked(path: Path, header: list[str], row: list):
+def append_event_csv(row: dict):
     OUT_DIR.mkdir(exist_ok=True)
-    write_header = not path.exists()
-    with open(path, "a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        if write_header:
-            w.writerow(header)
-        w.writerow(row)
-
-
-def log_routing_event_locked(
-    event_type: str,
-    mod_id: str,
-    from_mid: str,
-    to_mid: str,
-    mode: str,
-    source_tag: str,
-    now: float,
-    reason: str = "",
-):
-    obs = ble_observations.get(mod_id, {})
-
-    def fresh_rssi(mid_name: str):
-        info = obs.get(mid_name)
-        if info and (now - info["ts"]) <= BLE_STALE_S:
-            return info["rssi"]
-        return ""
-
-    append_csv_row_locked(
-        ROUTING_LOG_CSV,
-        ROUTING_LOG_HEADER,
-        [
-            datetime.now().isoformat(timespec="seconds"),
-            event_type,
-            mod_id,
-            from_mid,
-            to_mid,
-            mode,
-            source_tag,
-            fresh_rssi("MID-01"),
-            fresh_rssi("MID-02"),
-            fresh_rssi("MID-03"),
-            reason,
-        ],
-    )
-
-
-def load_assignments():
-    if ASSIGNMENTS_JSON.exists():
-        try:
-            data = json.loads(ASSIGNMENTS_JSON.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                room_assignments.update(data)
-        except Exception:
-            pass
-
-
-def save_assignments_locked():
-    OUT_DIR.mkdir(exist_ok=True)
-    ASSIGNMENTS_JSON.write_text(json.dumps(room_assignments, indent=2), encoding="utf-8")
-
-
-def prune_stale_middles_locked(now: float):
-    stale_mids = [
-        mid for mid, info in middle_states.items()
-        if (now - info["last_seen"]) > MIDDLE_STALE_S
+    file_exists = EVENTS_CSV.exists()
+    fieldnames = [
+        "timestamp",
+        "event",
+        "middle_id",
+        "module_id",
+        "assigned_room",
+        "rm_temp_c",
+        "conflict_detected",
+        "conflict_outlier",
+        "recommended_room",
+        "reason",
     ]
-    for mid in stale_mids:
-        del middle_states[mid]
-        print(f"[{TOP_ID}] Middle Pi offline (timeout > {MIDDLE_STALE_S:.0f}s): {mid}")
+    with EVENTS_CSV.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow({k: row.get(k, "") for k in fieldnames})
 
 
-def is_module_recording_locked(mod_id: str) -> bool:
-    for info in middle_states.values():
-        pkt = info.get("packet") or {}
-        b_nodes = pkt.get("bottom_nodes") or {}
-        b_info = b_nodes.get(mod_id)
-        if isinstance(b_info, dict) and b_info.get("is_recording"):
-            return True
-    return False
+def ensure_participant_locked(mod_id: str) -> dict:
+    if mod_id not in participants:
+        participants[mod_id] = {
+            "module_id": mod_id,
+            "ip": "",
+            "assigned_room": "UNASSIGNED",
+            "mode": "auto",  # "auto" or "manual"
+            "is_recording": False,
+            "recording_elapsed_s": 0.0,
+            "sim_mode": False,
+            "last_seen": time.time(),
+            "latest_reading": None,
+        }
+    return participants[mod_id]
 
 
-def default_middle_id_locked() -> str:
-    if "MID-01" in middle_states:
-        return "MID-01"
-    if middle_states:
-        return sorted(middle_states.keys())[0]
-    return "MID-01"
+def assign_room_locked(mod_id: str, new_room: str, source: str = ""):
+    p = ensure_participant_locked(mod_id)
+    old_room = p.get("assigned_room") or "UNASSIGNED"
+    if not new_room or new_room == old_room:
+        return
+    p["assigned_room"] = new_room
+    move_cooldown.record_move(mod_id, old_room, new_room)
+    if old_room != "UNASSIGNED" and old_room in middle_nodes:
+        old_mid = middle_nodes[old_room]
+        mid_url = old_mid.get("url", "").rstrip("/")
+        if mid_url:
+            threading.Thread(
+                target=post_json,
+                args=(f"{mid_url}/api/detach", {"module_id": mod_id}, 2.5),
+                daemon=True,
+            ).start()
+    print(f"[{TOP_ID}] Room assigned ({source}): {mod_id} {old_room} -> {new_room}")
 
 
-def resolve_route_locked(mod_id: str) -> dict:
-    now = time.time()
-    prune_stale_middles_locked(now)
-    entry = room_assignments.get(mod_id)
-    if entry and entry.get("mid_id"):
-        target_mid = entry["mid_id"]
-        mode = entry.get("mode", "auto")
+def get_fresh_ble_locked(mod_id: str, now: float) -> dict[str, float]:
+    raw = ble_table.get(mod_id, {})
+    fresh: dict[str, float] = {}
+    for mid_id, info in list(raw.items()):
+        if (now - info["ts"]) <= BLE_STALE_S:
+            fresh[mid_id] = float(info["rssi"])
+        else:
+            del raw[mid_id]
+    return fresh
+
+
+def run_auto_ble_routing_locked(now: float, target_mod: str | None = None) -> int:
+    """Assigns closest room based on BLE RSSI for modules in 'auto' mode (locked while recording)."""
+    moved_count = 0
+    mod_ids = [target_mod] if target_mod else sorted(participants.keys())
+    for mod_id in mod_ids:
+        p = participants.get(mod_id)
+        if not p:
+            continue
+        if p.get("mode", "auto") != "auto":
+            continue
+        if p.get("is_recording", False):
+            continue
+
+        fresh_rssi = get_fresh_ble_locked(mod_id, now)
+        if not fresh_rssi:
+            continue
+
+        best_mid, best_rssi = max(fresh_rssi.items(), key=lambda kv: kv[1])
+        cur_room = p.get("assigned_room", "UNASSIGNED")
+        if cur_room == "UNASSIGNED" or cur_room not in fresh_rssi:
+            assign_room_locked(mod_id, best_mid, source="auto-ble")
+            moved_count += 1
+        elif best_mid != cur_room:
+            cur_rssi = fresh_rssi[cur_room]
+            if (best_rssi - cur_rssi) >= BLE_HYSTERESIS_DBM:
+                assign_room_locked(mod_id, best_mid, source="auto-ble")
+                moved_count += 1
+    return moved_count
+
+
+def score_candidate_room(mod_id: str, p: dict, mid_id: str, mid_info: dict) -> float:
+    """Lower score is a better destination room for participant mod_id."""
+    ctx = mid_info.get("context_analysis") or {}
+    rm_temp = float(ctx.get("rm_temp_c", mid_info.get("rm_temp_c", 23.0)))
+    crowdedness = float(ctx.get("crowdedness", mid_info.get("active_bottom_count", 0)))
+    eq_wt = (ctx.get("strategy_vectors") or {}).get("Equality With Weight") or [0.0, 0.0, 0.0, 0.0]
+
+    r = p.get("latest_reading") or {}
+    nv = r.get("norm_vec") or [0.0, 0.0, 0.0, 0.0]
+    body_temp = float(r.get("mean_temp_c") or BODY_TEMP_THRESHOLD_C)
+
+    # Thermal alignment penalty
+    if body_temp >= BODY_TEMP_THRESHOLD_C:
+        thermal_pen = max(0.0, rm_temp - 22.0) * 0.6
     else:
-        target_mid = default_middle_id_locked()
-        mode = "auto"
-        room_assignments[mod_id] = {
-            "mid_id": target_mid,
-            "mode": mode,
-            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        thermal_pen = max(0.0, 24.0 - rm_temp) * 0.6
+
+    # Emotional/sensory stress overlap penalty + crowdedness penalty
+    emo_overlap = sum(float(nv[i]) * float(eq_wt[i]) for i in range(min(3, len(nv), len(eq_wt))))
+    conflict_pen = 1.5 if ctx.get("conflict_detected") else 0.0
+
+    return round(thermal_pen + emo_overlap * 0.5 + crowdedness * 0.35 + conflict_pen, 4)
+
+
+def compute_recommendation_locked(mod_id: str) -> dict:
+    p = participants.get(mod_id)
+    if not p:
+        return {"should_move": False, "target_room": None, "label": "Steady (No move)", "reason": ""}
+
+    # 1. Post-move cooldown filter check
+    in_cooldown, cooldown_label = move_cooldown.check(mod_id)
+    if in_cooldown:
+        return {
+            "should_move": False,
+            "target_room": None,
+            "cooldown_active": True,
+            "label": f"Steady ({cooldown_label})",
+            "reason": cooldown_label,
         }
-        save_assignments_locked()
-        log_routing_event_locked("ROOM_ASSIGN", mod_id, "", target_mid, mode, "ROUTE_INIT", now)
 
-    m_info = middle_states.get(target_mid)
-    middle_url = f"http://{m_info['ip']}:{m_info.get('port', 8001)}" if m_info else ""
+    cur_room = p.get("assigned_room", "UNASSIGNED")
+    if cur_room == "UNASSIGNED" or cur_room not in middle_nodes:
+        return {"should_move": False, "target_room": None, "label": "Steady (No move)", "reason": ""}
 
-    rec = latest_move_recommendations.get(mod_id)
-    active_rec = None
-    if isinstance(rec, dict):
-        if rec.get("from_mid") == target_mid and rec.get("to_mid") and rec.get("to_mid") != target_mid:
-            active_rec = rec
-        else:
-            latest_move_recommendations.pop(mod_id, None)
-
-    return {
-        "ok": True,
-        "mod_id": mod_id,
-        "mid_id": target_mid,
-        "middle_url": middle_url,
-        "mode": mode,
-        "locked": is_module_recording_locked(mod_id),
-        "move_recommendation": active_rec,
-    }
-
-
-def evaluate_ble_routing_locked(
-    mod_id: str,
-    now: float,
-    force_recheck: bool = False,
-    source_tag: str = "BLE",
-):
-    # Do not switch rooms while the participant is recording
-    if is_module_recording_locked(mod_id):
-        return
-
-    current = room_assignments.get(mod_id, {})
-    if current.get("mode") == "manual":
-        return
-
-    obs = ble_observations.get(mod_id, {})
-    fresh = {
-        mid: info["rssi"]
-        for mid, info in obs.items()
-        if (now - info["ts"]) <= BLE_STALE_S and mid in middle_states
-    }
-
-    if not fresh:
-        if force_recheck:
-            prev_mid = current.get("mid_id", "")
-            default_mid = default_middle_id_locked()
-            room_assignments[mod_id] = {
-                "mid_id": default_mid,
-                "mode": "auto",
-                "updated_at": datetime.now().isoformat(timespec="seconds"),
-            }
-            if prev_mid != default_mid:
-                latest_move_recommendations.pop(mod_id, None)
-            save_assignments_locked()
-            log_routing_event_locked("ROOM_ASSIGN", mod_id, prev_mid, default_mid, "auto", source_tag, now, "No BLE signal yet")
-            print(f"[{TOP_ID}] ROOM ASSIGN ({source_tag} - no BLE signal yet): {mod_id} -> {default_mid}")
-        return
-
-    best_mid, best_rssi = max(fresh.items(), key=lambda kv: kv[1])
-    cur_mid = current.get("mid_id")
-    rssi_summary = ", ".join(f"{m}:{r:.0f}dBm" for m, r in sorted(fresh.items()))
-
-    if force_recheck or not cur_mid or cur_mid not in fresh:
-        if cur_mid != best_mid or current.get("mode") != "auto":
-            room_assignments[mod_id] = {
-                "mid_id": best_mid,
-                "mode": "auto",
-                "rssi": best_rssi,
-                "updated_at": datetime.now().isoformat(timespec="seconds"),
-            }
-            if cur_mid != best_mid:
-                latest_move_recommendations.pop(mod_id, None)
-            save_assignments_locked()
-            log_routing_event_locked("ROOM_ASSIGN", mod_id, cur_mid or "", best_mid, "auto", source_tag, now, rssi_summary)
-            print(f"[{TOP_ID}] ROOM ASSIGN ({source_tag}): {mod_id} -> {best_mid} [{rssi_summary}]")
-        return
-
-    cur_rssi = fresh[cur_mid]
-    if best_mid != cur_mid and (best_rssi - cur_rssi) >= BLE_HYSTERESIS_DBM:
-        room_assignments[mod_id] = {
-            "mid_id": best_mid,
-            "mode": "auto",
-            "rssi": best_rssi,
-            "updated_at": datetime.now().isoformat(timespec="seconds"),
+    if p.get("is_recording", False):
+        return {
+            "should_move": False,
+            "target_room": None,
+            "label": "Locked (Recording in progress)",
+            "reason": "",
         }
-        latest_move_recommendations.pop(mod_id, None)
-        save_assignments_locked()
-        log_routing_event_locked("ROOM_SWITCH", mod_id, cur_mid, best_mid, "auto", source_tag, now, rssi_summary)
-        print(
-            f"[{TOP_ID}] ROOM SWITCH ({source_tag}): {mod_id} {cur_mid} -> {best_mid} [{rssi_summary}]"
-        )
 
+    r = p.get("latest_reading")
+    if not isinstance(r, dict):
+        return {"should_move": False, "target_room": None, "label": "Steady (No move)", "reason": ""}
 
-def periodic_auto_route_worker(stop_event: threading.Event):
-    while not stop_event.is_set():
-        stop_event.wait(AUTO_CHECK_INTERVAL_S)
-        if stop_event.is_set():
-            break
-        now = time.time()
-        with state_lock:
-            prune_stale_middles_locked(now)
-            all_mods = set(room_assignments.keys()) | set(ble_observations.keys())
-            for mod_id in sorted(all_mods):
-                if room_assignments.get(mod_id, {}).get("mode", "auto") == "auto":
-                    evaluate_ble_routing_locked(mod_id, now, force_recheck=False, source_tag="TIMER")
+    cur_mid = middle_nodes[cur_room]
+    cur_ctx = cur_mid.get("context_analysis") or {}
+    conflict_detected = bool(cur_ctx.get("conflict_detected", False))
+    conflict_outlier = cur_ctx.get("conflict_outlier")
 
+    other_rooms = [m_id for m_id in sorted(middle_nodes.keys()) if m_id != cur_room]
+    if not other_rooms:
+        return {"should_move": False, "target_room": None, "label": "Steady (No move)", "reason": ""}
 
-def analyze_participant_vitals(reading: dict | None, room_temp_c: float) -> dict | None:
-    if not isinstance(reading, dict):
-        return None
+    # Trigger move evaluation if this participant is the conflict outlier or room is in conflict
+    if not conflict_detected:
+        return {"should_move": False, "target_room": None, "label": "Steady (No move)", "reason": ""}
 
-    norm_vec = reading.get("norm_vec")
-    body_temp = reading.get("mean_temp_c")
+    if conflict_outlier and conflict_outlier != mod_id and int(cur_ctx.get("crowdedness", 1)) > 1:
+        return {"should_move": False, "target_room": None, "label": "Steady (No move)", "reason": ""}
 
-    has_norm = isinstance(norm_vec, list) and len(norm_vec) >= 3
-    active_emotions: list[str] = []
-    dominant_stress = "Unknown"
-
-    if has_norm:
-        z_emo = [float(norm_vec[i]) for i in range(3)]
-        active_emotions = [
-            EMOTION_NAMES[i]
-            for i in range(3)
-            if z_emo[i] >= 1.0
-        ]
-        if active_emotions:
-            weighted_scores = [z_emo[i] * EMOTION_WEIGHTS[i] for i in range(3)]
-            best_idx = max(range(3), key=lambda i: weighted_scores[i])
-            dominant_stress = EMOTION_NAMES[best_idx]
-        else:
-            dominant_stress = "Normal"
-
-    comfort = None
-    thermal_mismatch = False
-    if body_temp is not None:
-        bt = float(body_temp)
-        comfort = "Heat-Sensitive" if bt >= BODY_TEMP_THRESHOLD_C else "Cold-Sensitive"
-        thermal_mismatch = (
-            (comfort == "Heat-Sensitive" and room_temp_c >= TEMP_THRESHOLD_C)
-            or (comfort == "Cold-Sensitive" and room_temp_c < TEMP_THRESHOLD_C)
-        )
-
+    best_room = min(
+        other_rooms,
+        key=lambda m_id: score_candidate_room(mod_id, p, m_id, middle_nodes[m_id]),
+    )
+    best_temp = middle_nodes[best_room].get("rm_temp_c", 23.0)
+    reason = f"Conflict Outlier (Fairness priority) -> {best_room} ({best_temp}°C)"
     return {
-        "eda_peaks_2min": reading.get("eda_peaks_2min"),
-        "mean_bpm": reading.get("mean_bpm"),
-        "resp_rate_min": reading.get("resp_rate_min"),
-        "mean_temp_c": body_temp,
-        "thermal_comfort": comfort,
-        "thermal_mismatch": thermal_mismatch,
-        "stress_types": active_emotions,
-        "dominant_stress": dominant_stress,
+        "should_move": True,
+        "target_room": best_room,
+        "cooldown_active": False,
+        "label": f"Move -> {best_room}",
+        "reason": reason,
     }
 
 
-def compute_move_recommendations_locked(middles_out: dict[str, dict]) -> dict[str, dict]:
-    recommendations: dict[str, dict] = {}
-    if len(middles_out) < 2:
-        return recommendations
-
-    room_temp_map: dict[str, float] = {}
-    room_focus_emotion: dict[str, str] = {}
-    room_crowd_map: dict[str, float] = {}
-
-    for mid, m_val in middles_out.items():
-        ctx = m_val.get("context_analysis") or {}
-        room_temp_map[mid] = float(m_val.get("rm_temp_c", TEMP_THRESHOLD_C))
-        room_crowd_map[mid] = float(ctx.get("crowdedness", 0.0))
-
-        ew_vec = (ctx.get("strategy_vectors") or {}).get("Equality With Weight", [0.0, 0.0, 0.0])
-        if sum(ew_vec[:3]) > 0:
-            max_idx = ew_vec[:3].index(max(ew_vec[:3]))
-            room_focus_emotion[mid] = EMOTION_NAMES[max_idx]
-
-    for mid, m_val in sorted(middles_out.items()):
-        ctx = m_val.get("context_analysis") or {}
-        conflict_detected = bool(ctx.get("conflict_detected", False))
-        conflict_outlier = ctx.get("conflict_outlier")
-        current_temp = room_temp_map[mid]
-        bottom_nodes = m_val.get("bottom_nodes") or {}
-
-        for mod_id, b_info in sorted(bottom_nodes.items()):
-            va = b_info.get("vital_analysis") or analyze_participant_vitals(b_info.get("latest_reading"), current_temp) or {}
-            active_emotions = va.get("stress_types", [])
-            comfort = va.get("thermal_comfort")
-            thermal_mismatch = bool(va.get("thermal_mismatch", False))
-
-            best_target = None
-            reason_parts = []
-
-            if conflict_detected and thermal_mismatch and active_emotions:
-                for alt_mid, alt_temp in sorted(room_temp_map.items()):
-                    if alt_mid == mid:
-                        continue
-                    temp_ok = (alt_temp < TEMP_THRESHOLD_C) if comfort == "Heat-Sensitive" else (alt_temp >= TEMP_THRESHOLD_C)
-                    if temp_ok:
-                        alt_emo = room_focus_emotion.get(alt_mid)
-                        if alt_emo and alt_emo in active_emotions:
-                            best_target = alt_mid
-                            reason_parts.append(
-                                f"{comfort} & {', '.join(active_emotions)} -> {alt_mid} ({alt_temp}°C, {alt_emo} focus)"
-                            )
-                            break
-                        elif best_target is None:
-                            best_target = alt_mid
-                            reason_parts.append(
-                                f"{comfort} ({', '.join(active_emotions)}) -> {alt_mid} ({alt_temp}°C)"
-                            )
-
-            if best_target is None and conflict_detected and conflict_outlier == mod_id:
-                alt_candidates = [m for m in sorted(middles_out.keys()) if m != mid]
-                if alt_candidates:
-                    best_target = min(alt_candidates, key=lambda m: room_crowd_map.get(m, 0.0))
-                    reason_parts.append(
-                        f"Conflict Outlier (Fairness priority) -> {best_target} ({room_temp_map[best_target]}°C)"
-                    )
-
-            if best_target:
-                recommendations[mod_id] = {
-                    "from_mid": mid,
-                    "to_mid": best_target,
-                    "comfort": comfort,
-                    "active_emotions": active_emotions,
-                    "reason": "; ".join(reason_parts),
-                }
-
-    return recommendations
-
-
-def build_global_snapshot_locked() -> dict:
+def build_cluster_snapshot_locked() -> dict:
     now = time.time()
-    prune_stale_middles_locked(now)
-
-    total_bottom_active = 0
-    recording_mods: set[str] = set()
-    all_bpm = []
-    all_eda = []
-    all_resp = []
-    all_temp = []
-
-    middles_out = {}
-    for mid, info in sorted(middle_states.items()):
-        pkt = info["packet"]
-        rm_temp_c = float(pkt.get("rm_temp_c", TEMP_THRESHOLD_C))
-        total_bottom_active += pkt.get("active_bottom_count", 0)
-        bottom_nodes_out = {}
-
-        for b_id, b_info in pkt.get("bottom_nodes", {}).items():
-            b_copy = dict(b_info)
-            if b_copy.get("is_recording"):
-                recording_mods.add(b_id)
-                base_elapsed = float(b_copy.get("recording_elapsed_s", 0.0))
-                b_copy["recording_elapsed_s"] = round(base_elapsed + max(0.0, now - info["last_seen"]), 1)
-
-            r = b_copy.get("latest_reading")
-            b_copy["vital_analysis"] = analyze_participant_vitals(r, rm_temp_c)
-            bottom_nodes_out[b_id] = b_copy
-
-            if r:
-                if r.get("eda_peaks_2min") is not None:
-                    all_eda.append(r["eda_peaks_2min"])
-                if r.get("mean_bpm") is not None:
-                    all_bpm.append(r["mean_bpm"])
-                if r.get("resp_rate_min") is not None:
-                    all_resp.append(r["resp_rate_min"])
-                if r.get("mean_temp_c") is not None:
-                    all_temp.append(r["mean_temp_c"])
-
-        middles_out[mid] = {
-            "ip": info["ip"],
-            "port": info.get("port", 8001),
-            "last_seen_ago_s": round(now - info["last_seen"], 1),
-            "rm_temp_c": rm_temp_c,
-            "active_bottom_count": pkt.get("active_bottom_count", 0),
-            "active_module_ids": pkt.get("active_module_ids", []),
-            "recording_module_ids": pkt.get("recording_module_ids", []),
-            "group_summary": pkt.get("group_summary", {}),
-            "context_analysis": pkt.get("context_analysis", {}),
-            "bottom_nodes": bottom_nodes_out,
+    mids_out = {}
+    for mid_id in sorted(middle_nodes.keys()):
+        m = middle_nodes[mid_id]
+        stale = (now - m["last_seen"]) > MIDDLE_STALE_S
+        assigned_here = sorted(
+            mod_id for mod_id, p in participants.items() if p.get("assigned_room") == mid_id
+        )
+        mids_out[mid_id] = {
+            "middle_id": mid_id,
+            "ip": m.get("ip", ""),
+            "url": m.get("url", ""),
+            "online": not stale,
+            "last_seen_ago_s": round(now - m["last_seen"], 1),
+            "rm_temp_c": m.get("rm_temp_c", 23.0),
+            "rm_temp_source": m.get("rm_temp_source", "default"),
+            "active_bottom_count": len(assigned_here),
+            "active_module_ids": assigned_here,
+            "recording_module_ids": m.get("recording_module_ids", []),
+            "context_analysis": m.get("context_analysis", {}),
         }
 
-    move_recommendations = compute_move_recommendations_locked(middles_out)
-    latest_move_recommendations.clear()
-    latest_move_recommendations.update(move_recommendations)
-
-    ble_live = {}
-    for mod_id, per_mid in sorted(ble_observations.items()):
-        ble_live[mod_id] = {
-            mid: {
-                "rssi": info["rssi"],
-                "age_s": round(now - info["ts"], 1),
-            }
-            for mid, info in sorted(per_mid.items())
-            if (now - info["ts"]) <= BLE_STALE_S and mid in middle_states
+    mods_out = {}
+    recording_now = []
+    for mod_id in sorted(participants.keys()):
+        p = participants[mod_id]
+        online = (now - p["last_seen"]) <= BOTTOM_STALE_S
+        if p.get("is_recording"):
+            recording_now.append(mod_id)
+        ble_signals = get_fresh_ble_locked(mod_id, now)
+        rec = compute_recommendation_locked(mod_id)
+        mods_out[mod_id] = {
+            "module_id": mod_id,
+            "ip": p.get("ip", ""),
+            "online": online,
+            "last_seen_ago_s": round(now - p["last_seen"], 1),
+            "assigned_room": p.get("assigned_room", "UNASSIGNED"),
+            "mode": p.get("mode", "auto"),
+            "is_recording": bool(p.get("is_recording", False)),
+            "recording_elapsed_s": float(p.get("recording_elapsed_s", 0.0)),
+            "ble_signals": ble_signals,
+            "latest_reading": p.get("latest_reading"),
+            "recommendation": rec,
         }
 
-    def avg(vals: list[float]) -> float | None:
-        return round(sum(vals) / len(vals), 2) if vals else None
+    directory = {
+        mid_id: m["url"] for mid_id, m in mids_out.items() if m.get("url")
+    }
 
     return {
-        "updated_at": datetime.now().isoformat(timespec="seconds"),
         "top_id": TOP_ID,
-        "auto_check_interval_s": AUTO_CHECK_INTERVAL_S,
-        "connected_middle_count": len(middle_states),
-        "total_active_bottom_count": total_bottom_active,
-        "total_recording_count": len(recording_mods),
-        "recording_module_ids": sorted(recording_mods),
-        "room_assignments": room_assignments,
-        "ble_rssi": ble_live,
-        "move_recommendations": move_recommendations,
-        "global_summary": {
-            "mean_eda_peaks_2min": avg(all_eda),
-            "mean_bpm": avg(all_bpm),
-            "mean_resp_rate_min": avg(all_resp),
-            "mean_temp_c": avg(all_temp),
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "cooldown_config": {
+            "rounds": MOVE_COOLDOWN_ROUNDS,
+            "seconds": int(MOVE_COOLDOWN_S),
         },
-        "middle_nodes": middles_out,
+        "recording_now": recording_now,
+        "directory": directory,
+        "middle_nodes": mids_out,
+        "participants": mods_out,
     }
 
 
-def reset_all_cluster_data() -> dict:
-    """Wipes all experiment data across Top, Middle, and Bottom Pis while preserving connections."""
-    with state_lock:
-        for info in middle_states.values():
-            pkt = info.get("packet") or {}
-            for b_info in (pkt.get("bottom_nodes") or {}).values():
-                if b_info.get("is_recording"):
-                    return {
-                        "ok": False,
-                        "error": "Cannot initialize while a node is recording. Wait for capture to finish first.",
-                    }
-        middles_snapshot = {
-            mid: (info["ip"], info.get("port", 8001))
-            for mid, info in middle_states.items()
-        }
-
-    cleared_middles = []
-    cleared_bottoms = []
-    for mid, (m_ip, m_port) in sorted(middles_snapshot.items()):
-        resp = post_json_resp(f"http://{m_ip}:{m_port}/api/reset", {}, timeout=4.0)
-        if resp and resp.get("ok"):
-            cleared_middles.append(mid)
-            cleared_bottoms.extend(resp.get("cleared_bottoms", []))
-
-    with state_lock:
-        prev_recording_state.clear()
-        last_room_signature.clear()
-        last_logged_recommendations.clear()
-        latest_move_recommendations.clear()
-
-        for info in middle_states.values():
-            pkt = info.get("packet")
-            if isinstance(pkt, dict):
-                pkt["reporting_bottom_count"] = 0
-                for b_info in (pkt.get("bottom_nodes") or {}).values():
-                    if isinstance(b_info, dict):
-                        b_info["latest_reading"] = None
-
-        if OUT_DIR.exists():
-            for item in OUT_DIR.iterdir():
-                try:
-                    if item.is_dir():
-                        shutil.rmtree(item)
-                    else:
-                        item.unlink()
-                except OSError:
-                    pass
-        OUT_DIR.mkdir(exist_ok=True)
-        RAW_SESSIONS_DIR.mkdir(exist_ok=True)
-        save_assignments_locked()
-
-        snapshot = build_global_snapshot_locked()
-        LATEST_JSON.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
-
-    print(f"[{TOP_ID}] INITIALIZED: Cleared all experiment data (Middles={cleared_middles}, Bottoms={sorted(set(cleared_bottoms))})")
-    return {
-        "ok": True,
-        "cleared_middles": cleared_middles,
-        "cleared_bottoms": sorted(set(cleared_bottoms)),
-    }
+def auto_ble_worker(stop_event: threading.Event):
+    while not stop_event.is_set():
+        with state_lock:
+            run_auto_ble_routing_locked(time.time())
+        stop_event.wait(AUTO_BLE_INTERVAL_S)
 
 
-def record_experiment_logs_locked(mid: str, event_type: str, payload: dict, snapshot: dict, now: float):
-    if event_type == "reset":
-        return
-
-    ts_iso = datetime.now().isoformat(timespec="seconds")
-    OUT_DIR.mkdir(exist_ok=True)
-
-    with open(RAW_PACKETS_JSONL, "a", encoding="utf-8") as jf:
-        jf.write(json.dumps({"received_at": ts_iso, "middle_id": mid, "packet": payload}) + "\n")
-
-    m_val = snapshot["middle_nodes"].get(mid, {})
-    ctx = m_val.get("context_analysis") or {}
-    ctrl = ctx.get("room_control") or {}
-    cos = ctx.get("cosine_similarity") or {}
-    s_vecs = ctx.get("strategy_vectors") or {}
-    p_weights = ctx.get("priority_weights") or {}
-    gs = payload.get("group_summary") or {}
-    recs = snapshot.get("move_recommendations") or {}
-
-    for b_id, b_info in (m_val.get("bottom_nodes") or {}).items():
-        is_rec = bool(b_info.get("is_recording", False))
-        was_rec = prev_recording_state.get(b_id, False)
-        if is_rec != was_rec:
-            ev_name = "CAPTURE_START" if is_rec else "CAPTURE_STOP"
-            append_csv_row_locked(
-                CAPTURE_EVENTS_CSV,
-                CAPTURE_EVENTS_HEADER,
-                [
-                    ts_iso,
-                    b_id,
-                    mid,
-                    ev_name,
-                    b_info.get("recording_elapsed_s", 0.0),
-                    bool(b_info.get("sim_mode", False)),
-                ],
-            )
-            prev_recording_state[b_id] = is_rec
-
-    sig = json.dumps({
-        "rm_temp_c": m_val.get("rm_temp_c"),
-        "active": m_val.get("active_module_ids"),
-        "rec": m_val.get("recording_module_ids"),
-        "ctrl": ctrl,
-        "conflict": ctx.get("conflict_detected"),
-        "outlier": ctx.get("conflict_outlier"),
-        "cos": cos,
-    }, sort_keys=True)
-
-    if event_type != "sync" or last_room_signature.get(mid) != sig:
-        last_room_signature[mid] = sig
-        append_csv_row_locked(
-            ROOM_CONTEXT_CSV,
-            ROOM_CONTEXT_HEADER,
-            [
-                ts_iso,
-                event_type,
-                mid,
-                payload.get("trigger_module", ""),
-                m_val.get("rm_temp_c", ""),
-                ctx.get("crowdedness", ""),
-                payload.get("active_bottom_count", 0),
-                payload.get("reporting_bottom_count", 0),
-                json.dumps(m_val.get("active_module_ids", [])),
-                json.dumps(m_val.get("recording_module_ids", [])),
-                gs.get("mean_eda_peaks_2min", ""),
-                gs.get("mean_bpm", ""),
-                gs.get("mean_resp_rate_min", ""),
-                gs.get("mean_temp_c", ""),
-                json.dumps(s_vecs.get("Equality", [])),
-                json.dumps(s_vecs.get("Equality With Weight", [])),
-                json.dumps(s_vecs.get("Fairness", [])),
-                cos.get("Equality", ""),
-                cos.get("Equality With Weight", ""),
-                cos.get("Fairness", ""),
-                bool(ctx.get("conflict_detected", False)),
-                ctx.get("conflict_outlier", ""),
-                ctrl.get("ac_target_temp_c", ""),
-                ctrl.get("device_setting", ""),
-            ],
-        )
-
-    for mod_id, rec in recs.items():
-        rec_sig = (rec.get("to_mid", ""), rec.get("reason", ""))
-        if last_logged_recommendations.get(mod_id) != rec_sig:
-            last_logged_recommendations[mod_id] = rec_sig
-            assign_info = room_assignments.get(mod_id, {})
-            log_routing_event_locked(
-                "MOVE_RECOMMENDED",
-                mod_id,
-                rec.get("from_mid", ""),
-                rec.get("to_mid", ""),
-                assign_info.get("mode", "auto"),
-                "RECOMMENDATION",
-                now,
-                rec.get("reason", ""),
-            )
-
-    if event_type == "reading":
-        append_csv_row_locked(
-            MASTER_CSV,
-            MASTER_HEADER,
-            [
-                ts_iso,
-                mid,
-                payload.get("trigger_module", ""),
-                payload.get("active_bottom_count", 0),
-                payload.get("reporting_bottom_count", 0),
-                gs.get("mean_eda_peaks_2min", ""),
-                gs.get("mean_bpm", ""),
-                gs.get("mean_resp_rate_min", ""),
-                gs.get("mean_temp_c", ""),
-                json.dumps(payload),
-            ],
-        )
-
-        trig_mod = str(payload.get("trigger_module", "")).strip().upper()
-        for b_id, b_info in sorted((m_val.get("bottom_nodes") or {}).items()):
-            r = b_info.get("latest_reading")
-            if not isinstance(r, dict):
-                continue
-            va = b_info.get("vital_analysis") or {}
-            nv = r.get("norm_vec") if isinstance(r.get("norm_vec"), list) else []
-            z_eda = nv[0] if len(nv) > 0 else ""
-            z_hr = nv[1] if len(nv) > 1 else ""
-            z_rr = nv[2] if len(nv) > 2 else ""
-            z_temp = nv[3] if len(nv) > 3 else ""
-
-            assign_info = room_assignments.get(b_id, {})
-            obs_mid = (ble_observations.get(b_id) or {}).get(mid)
-            cur_rssi = obs_mid["rssi"] if obs_mid and (now - obs_mid["ts"]) <= BLE_STALE_S else ""
-            rec_for_mod = recs.get(b_id) or {}
-
-            append_csv_row_locked(
-                PARTICIPANT_SESSIONS_CSV,
-                PARTICIPANT_SESSION_HEADER,
-                [
-                    ts_iso,
-                    mid,
-                    trig_mod,
-                    1 if b_id == trig_mod else 0,
-                    b_id,
-                    assign_info.get("mode", "auto"),
-                    cur_rssi,
-                    bool(b_info.get("is_recording", False)),
-                    bool(b_info.get("sim_mode", False)),
-                    r.get("eda_peaks_2min", ""),
-                    r.get("mean_bpm", ""),
-                    r.get("resp_rate_min", ""),
-                    r.get("mean_temp_c", ""),
-                    z_eda,
-                    z_hr,
-                    z_rr,
-                    z_temp,
-                    r.get("adaptability_score", ""),
-                    p_weights.get(b_id, ""),
-                    va.get("thermal_comfort", ""),
-                    va.get("thermal_mismatch", ""),
-                    "|".join(va.get("stress_types", [])),
-                    va.get("dominant_stress", ""),
-                    1 if ctx.get("conflict_outlier") == b_id else 0,
-                    m_val.get("rm_temp_c", ""),
-                    ctx.get("crowdedness", ""),
-                    ctrl.get("ac_target_temp_c", ""),
-                    ctrl.get("device_setting", ""),
-                    bool(ctx.get("conflict_detected", False)),
-                    cos.get("Equality", ""),
-                    cos.get("Equality With Weight", ""),
-                    cos.get("Fairness", ""),
-                    rec_for_mod.get("to_mid", ""),
-                    rec_for_mod.get("reason", ""),
-                ],
-            )
-
-
-def build_export_zip_bytes() -> bytes:
-    buf = io.BytesIO()
-    with state_lock:
-        OUT_DIR.mkdir(exist_ok=True)
-        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for p in sorted(OUT_DIR.rglob("*")):
-                if p.is_file():
-                    zf.write(p, arcname=str(p.relative_to(OUT_DIR)))
-    return buf.getvalue()
-
-
-def render_rooms_html() -> str:
-    return """<!doctype html>
-<html>
+DASHBOARD_HTML = """<!doctype html>
+<html lang="en">
 <head>
-  <meta charset="utf-8">
-  <title>Vital Cluster — Dynamic Room Router & Context Control</title>
-  <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 1460px; margin: 24px auto; padding: 0 16px; background: #111827; color: #f3f4f6; }
-    h1 { font-size: 20px; margin-bottom: 6px; }
-    h2 { font-size: 16px; margin: 24px 0 10px 0; color: #e5e7eb; }
-    p.sub { color: #9ca3af; font-size: 13px; margin-top: 0; }
-    button, a.btn { background: #2563eb; color: #fff; border: none; padding: 6px 10px; border-radius: 6px; cursor: pointer; margin-right: 6px; font-size: 12px; text-decoration: none; display: inline-block; }
-    button:disabled { opacity: 0.38; cursor: not-allowed; }
-    button.auto { background: #059669; }
-    button.check { background: #7c3aed; margin-left: 8px; }
-    a.export-btn { background: #0d9488; font-weight: 600; margin-left: 4px; }
-    button.reset-btn { background: #dc2626; font-weight: 700; margin-left: 4px; }
-    button.reset-btn:hover { background: #b91c1c; }
-    button.move-btn { background: #d97706; font-weight: 600; margin-top: 4px; }
-    button.active { outline: 2px solid #fbbf24; font-weight: 700; }
-    table { width: 100%; border-collapse: collapse; margin-top: 12px; background: #1f2937; border-radius: 8px; overflow: hidden; }
-    th, td { padding: 10px 10px; border-bottom: 1px solid #374151; text-align: left; font-size: 13px; vertical-align: middle; }
-    th { background: #0f172a; color: #9ca3af; font-weight: 600; }
-    .badge { padding: 2px 8px; border-radius: 999px; font-size: 11px; background: #374151; display: inline-block; margin-right: 4px; margin-top: 2px; }
-    .badge-ok { background: #065f46; color: #a7f3d0; }
-    .badge-warn { background: #991b1b; color: #fecaca; font-weight: 700; }
-    .badge-rec { background: #b91c1c; color: #fef2f2; font-weight: 700; animation: pulseRec 1.4s infinite; }
-    .badge-idle { background: #1e3a8a; color: #bfdbfe; }
-    .badge-lock { background: #78350f; color: #fde68a; font-weight: 600; }
-    .badge-heat { background: #9a3412; color: #fed7aa; font-weight: 600; }
-    .badge-cold { background: #075985; color: #bae6fd; font-weight: 600; }
-    .badge-stress { background: #7f1d1d; color: #fecaca; font-weight: 600; }
-    @keyframes pulseRec {
-      0% { opacity: 1; }
-      50% { opacity: 0.65; }
-      100% { opacity: 1; }
-    }
-    .rssi { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px; color: #93c5fd; }
-    .mono { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px; }
-    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; margin-top: 10px; }
-    .card { background: #1f2937; border: 1px solid #374151; border-radius: 8px; padding: 14px; }
-    .card-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; border-bottom: 1px solid #374151; padding-bottom: 8px; }
-    .kv { display: flex; justify-content: space-between; font-size: 12px; margin: 5px 0; color: #d1d5db; }
-    .kv span.lbl { color: #9ca3af; }
-  </style>
+<meta charset="utf-8">
+<title>Vital Cluster — Dynamic Room Router</title>
+<style>
+  body { background:#0b1120; color:#e2e8f0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; margin:0; padding:18px 22px; }
+  h1 { font-size:20px; margin:0 0 4px 0; color:#f8fafc; }
+  .sub { font-size:12px; color:#94a3b8; margin-bottom:12px; }
+  .toolbar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:12px; }
+  button { border:none; border-radius:6px; padding:7px 13px; font-weight:600; font-size:12px; cursor:pointer; color:#fff; }
+  .btn-purple { background:#7c3aed; }
+  .btn-green { background:#059669; }
+  .btn-red { background:#dc2626; }
+  .btn-blue { background:#2563eb; padding:5px 9px; font-size:11px; }
+  .btn-amber { background:#d97706; padding:5px 10px; font-size:11px; margin-top:4px; }
+  .btn-auto { background:#0d9488; padding:5px 9px; font-size:11px; }
+  .btn-dim { opacity:0.55; }
+  .pills { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:14px; font-size:11px; }
+  .pill { background:#1e293b; border:1px solid #334155; border-radius:999px; padding:4px 10px; color:#cbd5e1; }
+  table { width:100%; border-collapse:collapse; background:#111827; border:1px solid #1f2937; border-radius:8px; overflow:hidden; font-size:12px; margin-bottom:20px; }
+  th { background:#1e293b; color:#94a3b8; text-align:left; padding:9px 10px; font-size:11px; border-bottom:1px solid #334155; }
+  td { padding:10px; border-bottom:1px solid #1f2937; vertical-align:middle; }
+  .badge { display:inline-block; padding:2px 7px; border-radius:999px; font-size:10px; font-weight:700; margin-right:4px; margin-top:3px; }
+  .b-online { background:#1e3a8a; color:#93c5fd; }
+  .b-rec { background:#7f1d1d; color:#fca5a5; }
+  .b-cold { background:#0369a1; color:#e0f2fe; }
+  .b-emo { background:#b91c1c; color:#fee2e2; }
+  .b-norm { background:#065f46; color:#d1fae5; }
+  .b-steady { background:#065f46; color:#6ee7b7; }
+  .b-conflict { background:#991b1b; color:#fecaca; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit, minmax(290px, 1fr)); gap:14px; }
+  .card { background:#111827; border:1px solid #1f2937; border-radius:8px; padding:12px 14px; }
+  .card-hdr { display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; font-weight:700; font-size:13px; }
+  .kv { display:flex; justify-content:space-between; font-size:11px; padding:3px 0; color:#cbd5e1; }
+  .kv span:first-child { color:#94a3b8; }
+  .steady-txt { color:#34d399; font-weight:600; }
+  .cooldown-txt { color:#fbbf24; font-weight:600; }
+  .move-txt { color:#fbbf24; font-weight:700; }
+  .muted { color:#64748b; }
+</style>
 </head>
 <body>
   <h1>Dynamic Room Router & Context Control</h1>
-  <p class="sub">
-    Timer automatically checks closest room every <span id="interval">15</span>s when in <b>AUTO (BLE)</b> mode (locked during recording).
-    <button class="check" onclick="recheckAll()">Check Closest Now</button>
-    <a class="btn export-btn" href="/api/export.zip">Download All Experiment Data (.ZIP)</a>
-    <button class="reset-btn" onclick="initializeAllData()">Initialize (Clear All Data)</button>
-  </p>
-  <div id="middles"></div>
-
+  <div class="sub" id="subline">Timer automatically checks closest room every 15s when in AUTO (BLE) mode (locked during recording).</div>
+  <div class="toolbar">
+    <button class="btn-purple" onclick="postAction('/api/check_closest', {})">Check Closest Now</button>
+    <button class="btn-green" onclick="window.location='/api/export_zip'">Download All Experiment Data (.ZIP)</button>
+    <button class="btn-red" onclick="resetAll()">Initialize (Clear All Data)</button>
+  </div>
+  <div class="pills" id="pills"></div>
   <table>
     <thead>
       <tr>
@@ -864,259 +440,140 @@ def render_rooms_html() -> str:
         <th>Switch Room</th>
       </tr>
     </thead>
-    <tbody id="rows"></tbody>
+    <tbody id="mod-rows"></tbody>
   </table>
-
-  <h2>Room Context Vectors, Cosine Similarity & Device Settings</h2>
+  <h2 style="font-size:14px;margin:0 0 10px 0;color:#cbd5e1;">Room Context Vectors, Cosine Similarity & Device Settings</h2>
   <div class="cards" id="room-cards"></div>
 
-  <script>
-    let latestData = null;
-    let latestFetchMs = 0;
+<script>
+async function postAction(url, body) {
+  await fetch(url, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body || {})
+  });
+  refresh();
+}
+function resetAll() {
+  if (!confirm('Clear all experiment readings, room assignments, and move cooldowns?')) return;
+  if (!confirm('Confirm again: Initialize and delete current session data?')) return;
+  postAction('/api/reset', {});
+}
+function fmtBle(ble) {
+  const keys = Object.keys(ble || {}).sort();
+  if (!keys.length) return '<span class="muted">No BLE beacon detected yet</span>';
+  return keys.map(k => `${k}: ${ble[k]} dBm`).join(' | ');
+}
+function fmtVitals(r) {
+  if (!r) return '<span class="muted">Waiting for capture...</span>';
+  const eda = r.eda_peaks_2min ?? '-';
+  const hr = r.mean_bpm != null ? Number(r.mean_bpm).toFixed(1) + ' bpm' : '-';
+  const rr = r.resp_rate_min != null ? Math.round(r.resp_rate_min) + '/m' : '-';
+  const temp = r.mean_temp_c != null ? r.mean_temp_c + '° C' : '-';
+  const sens = (Number(r.mean_temp_c || 36) < 36.0) ? 'Cold-Sensitive' : 'Warm-Sensitive';
+  const emo = r.dominant_emotion || 'Normal';
+  const emoCls = emo === 'Normal' ? 'b-norm' : 'b-emo';
+  return `<div>EDA:${eda} | HR:${hr} | RR:${rr} | Temp:${temp}</div>
+          <div><span class="badge b-cold">${sens}</span><span class="badge ${emoCls}">${emo}</span></div>`;
+}
+function fmtAdapt(r, priMap, modId) {
+  if (!r) return '<span class="muted">Waiting for capture...</span>';
+  const sc = r.adaptability_score != null ? Number(r.adaptability_score).toFixed(3) : '-';
+  const pri = priMap && priMap[modId] != null ? Number(priMap[modId]).toFixed(3) : '-';
+  const z = Array.isArray(r.norm_vec) ? '[' + r.norm_vec.map(v => Number(v).toFixed(2)).join(', ') + ']' : '-';
+  return `<div>Score: ${sc} | Pri: ${pri}</div><div class="muted">Z: ${z}</div>`;
+}
+async function refresh() {
+  const res = await fetch('/api/state');
+  const data = await res.json();
+  const mids = Object.values(data.middle_nodes || {});
+  const mods = Object.values(data.participants || {});
+  const cd = data.cooldown_config || {rounds: 3, seconds: 1800};
 
-    async function assign(modId, midId, mode) {
-      const res = await fetch('/api/assign', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({mod_id: modId, mid_id: midId, mode: mode})
-      });
-      const out = await res.json();
-      if (!out.ok) {
-        alert(out.error || "Cannot switch room right now.");
-      }
-      refresh();
+  document.getElementById('subline').textContent =
+    `Timer checks closest room every 15s in AUTO (BLE) mode (locked during recording). Post-move cooldown: ${cd.rounds} rounds or ${Math.round(cd.seconds/60)} min.`;
+
+  const pills = mids.map(m =>
+    `<span class="pill">${m.middle_id}: ${m.ip} (${m.active_bottom_count} active)</span>`
+  );
+  const recTxt = (data.recording_now && data.recording_now.length) ? data.recording_now.join(', ') : 'None';
+  pills.push(`<span class="pill">Recording Now: ${recTxt}</span>`);
+  document.getElementById('pills').innerHTML = pills.join('');
+
+  const midIds = mids.map(m => m.middle_id);
+  const rowsHtml = mods.map(p => {
+    const r = p.latest_reading;
+    const assigned = p.assigned_room || 'UNASSIGNED';
+    const midCtx = (data.middle_nodes[assigned] || {}).context_analysis || {};
+    const priMap = midCtx.priority_weights || {};
+    const statusBadge = p.is_recording
+      ? `<span class="badge b-rec">Recording (${Math.round(p.recording_elapsed_s)}s)</span>`
+      : `<span class="badge b-online">${p.online ? 'Online (Idle)' : 'Offline'}</span>`;
+
+    const rec = p.recommendation || {};
+    let recHtml = `<span class="steady-txt">${rec.label || 'Steady (No move)'}</span>`;
+    if (rec.cooldown_active) {
+      recHtml = `<span class="cooldown-txt">${rec.label}</span>`;
+    } else if (rec.should_move && rec.target_room) {
+      recHtml = `<div class="move-txt">${rec.label}</div>
+                 <div class="muted" style="font-size:11px;">${rec.reason || ''}</div>
+                 <button class="btn-amber" onclick="postAction('/api/move', {module_id:'${p.module_id}', target_room:'${rec.target_room}'})">Apply Move</button>`;
     }
-    async function recheckAll() {
-      await fetch('/api/recheck', { method: 'POST' });
-      refresh();
-    }
-    async function initializeAllData() {
-      const firstOk = confirm(
-        "Step 1 of 2: Delete ALL recorded experiment data (CSV logs, raw 5Hz files, baseline histories, and dashboard metrics) across TOP, MIDDLE, and BOTTOM Pis?"
-      );
-      if (!firstOk) return;
 
-      const secondOk = confirm(
-        "Step 2 of 2 (FINAL CONFIRMATION): Are you sure you want to permanently wipe all old test data before starting the experiment? This cannot be undone."
-      );
-      if (!secondOk) return;
+    const roomBtns = midIds.map(mId =>
+      `<button class="btn-blue ${assigned === mId && p.mode === 'manual' ? '' : 'btn-dim'}"
+        onclick="postAction('/api/switch_room', {module_id:'${p.module_id}', room:'${mId}', mode:'manual'})">${mId}</button>`
+    ).join(' ');
+    const autoBtn = `<button class="btn-auto ${p.mode === 'auto' ? '' : 'btn-dim'}"
+      onclick="postAction('/api/switch_room', {module_id:'${p.module_id}', mode:'auto'})">AUTO (BLE)</button>`;
 
-      const res = await fetch('/api/reset', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ confirmed: true })
-      });
-      const out = await res.json();
-      if (!out.ok) {
-        alert("Initialize aborted: " + (out.error || "Unknown error"));
-        return;
-      }
-      alert(
-        "Initialized successfully! Cleared data on TOP-01, Middles: [" +
-        (out.cleared_middles || []).join(", ") +
-        "], Bottoms: [" +
-        (out.cleared_bottoms || []).join(", ") +
-        "]."
-      );
-      refresh();
-    }
-    function fmtSim(v) {
-      return (v === null || v === undefined) ? '-' : Number(v).toFixed(4);
-    }
-    function fmtVal(v, suffix = '') {
-      return (v === null || v === undefined || v === '') ? '-' : `${v}${suffix}`;
-    }
-    async function refresh() {
-      const res = await fetch('/api/status');
-      latestData = await res.json();
-      latestFetchMs = Date.now();
-      renderDashboard();
-    }
-    function renderDashboard() {
-      if (!latestData) return;
-      const data = latestData;
-      const driftSec = (Date.now() - latestFetchMs) / 1000.0;
+    return `<tr>
+      <td><strong>${p.module_id}</strong></td>
+      <td>${statusBadge}</td>
+      <td><strong>${assigned}</strong></td>
+      <td>${p.mode}</td>
+      <td>${fmtBle(p.ble_signals)}</td>
+      <td>${fmtVitals(r)}</td>
+      <td>${fmtAdapt(r, priMap, p.module_id)}</td>
+      <td>${recHtml}</td>
+      <td>${roomBtns} ${autoBtn}</td>
+    </tr>`;
+  }).join('');
+  document.getElementById('mod-rows').innerHTML = rowsHtml || '<tr><td colspan="9" class="muted">No participants connected yet.</td></tr>';
 
-      if (data.auto_check_interval_s) {
-        document.getElementById('interval').textContent = data.auto_check_interval_s;
-      }
-      const mids = Object.keys(data.middle_nodes);
-      if (!mids.includes('MID-01')) mids.push('MID-01');
-      if (!mids.includes('MID-02')) mids.push('MID-02');
-      if (!mids.includes('MID-03')) mids.push('MID-03');
-      mids.sort();
+  const cardsHtml = mids.map(m => {
+    const ctx = m.context_analysis || {};
+    const conflict = Boolean(ctx.conflict_detected);
+    const outlier = ctx.conflict_outlier || '';
+    const badge = conflict
+      ? `<span class="badge b-conflict">CONFLICT DETECTED (${outlier})</span>`
+      : `<span class="badge b-steady">STEADY STATE</span>`;
+    const activeMods = (m.active_module_ids && m.active_module_ids.length) ? m.active_module_ids.join(', ') : 'None';
+    const crowd = (m.active_bottom_count / 10).toFixed(1);
+    const ctrl = ctx.room_control || {};
+    const ew = (ctx.strategy_vectors || {})['Equality With Weight'] || [0,0,0,0];
+    const cos = ctx.cosine_similarity || {};
+    const srcTag = m.rm_temp_source === 'microbit' ? ' (micro:bit)' : '';
 
-      const recMods = data.recording_module_ids || [];
-      const recSummaryBadge = recMods.length > 0
-        ? `<span class="badge badge-rec">● Recording Now (${recMods.length}): ${recMods.join(', ')}</span>`
-        : `<span class="badge">Recording Now: None</span>`;
-
-      document.getElementById('middles').innerHTML = mids.map(m => {
-        const info = data.middle_nodes[m];
-        return `<span class="badge">${m}: ${info ? info.ip + ' (' + info.active_bottom_count + ' active)' : 'offline'}</span>`;
-      }).join('') + ' ' + recSummaryBadge;
-
-      const mods = new Set(Object.keys(data.room_assignments || {}));
-      const latestByMod = {};
-      const vitalAnalysisByMod = {};
-      const priorityByMod = {};
-      const nodeStateByMod = {};
-
-      for (const [mKey, mVal] of Object.entries(data.middle_nodes || {})) {
-        (mVal.active_module_ids || []).forEach(id => mods.add(id));
-        const bNodes = mVal.bottom_nodes || {};
-        for (const [bId, bInfo] of Object.entries(bNodes)) {
-          const isRec = Boolean(bInfo.is_recording);
-          nodeStateByMod[bId] = {
-            online: true,
-            is_recording: isRec,
-            recording_elapsed_s: (bInfo.recording_elapsed_s || 0) + (isRec ? driftSec : 0),
-            sim_mode: Boolean(bInfo.sim_mode),
-            room: mKey,
-          };
-          if (bInfo.latest_reading) latestByMod[bId] = bInfo.latest_reading;
-          if (bInfo.vital_analysis) vitalAnalysisByMod[bId] = bInfo.vital_analysis;
-        }
-        const pMap = ((mVal.context_analysis || {}).priority_weights) || {};
-        for (const [pId, pVal] of Object.entries(pMap)) {
-          priorityByMod[pId] = pVal;
-        }
-      }
-      if (mods.size === 0) { mods.add('MOD-01'); mods.add('MOD-02'); mods.add('MOD-03'); }
-
-      const recs = data.move_recommendations || {};
-      const tbody = document.getElementById('rows');
-      tbody.innerHTML = Array.from(mods).sort().map(mod => {
-        const cur = (data.room_assignments || {})[mod] || {mid_id: 'MID-01', mode: 'auto'};
-        const st = nodeStateByMod[mod];
-        const isLocked = Boolean(st && st.is_recording);
-
-        let captureBadge = '<span class="badge">Offline</span>';
-        if (st) {
-          if (st.is_recording) {
-            const simTag = st.sim_mode ? ' [SIM]' : '';
-            captureBadge = `<span class="badge badge-rec">● RECORDING (${Math.round(st.recording_elapsed_s)}s)${simTag}</span>`;
-          } else {
-            captureBadge = '<span class="badge badge-idle">Online (Idle)</span>';
-          }
-        }
-
-        const modeHtml = isLocked
-          ? `<span class="badge">${cur.mode}</span><span class="badge badge-lock">LOCKED</span>`
-          : `<span class="badge">${cur.mode}</span>`;
-
-        const rssiMap = (data.ble_rssi || {})[mod] || {};
-        const rssiKeys = Object.keys(rssiMap).sort();
-        const rssiText = rssiKeys.length
-          ? rssiKeys.map(k => `${k}: ${rssiMap[k].rssi} dBm`).join(' | ')
-          : 'No BLE beacon detected yet';
-
-        const rData = latestByMod[mod];
-        const va = vitalAnalysisByMod[mod];
-        let vitalsHtml = '<span style="color:#9ca3af;">Waiting for capture...</span>';
-        if (rData) {
-          const eda = fmtVal(rData.eda_peaks_2min);
-          const hr = fmtVal(rData.mean_bpm, ' bpm');
-          const rr = fmtVal(rData.resp_rate_min, '/m');
-          const bt = fmtVal(rData.mean_temp_c, '°C');
-
-          let comfortBadge = '';
-          if (va && va.thermal_comfort) {
-            const cCls = va.thermal_comfort === 'Heat-Sensitive' ? 'badge-heat' : 'badge-cold';
-            const warnTag = va.thermal_mismatch ? ' (!)' : '';
-            comfortBadge = `<span class="badge ${cCls}">${va.thermal_comfort}${warnTag}</span>`;
-          }
-
-          let stressBadge = '<span class="badge badge-ok">Normal</span>';
-          if (va) {
-            const sTypes = va.stress_types || [];
-            if (sTypes.length > 0) {
-              stressBadge = sTypes.map(s => {
-                const domTag = (sTypes.length > 1 && s === va.dominant_stress) ? ' ★' : '';
-                return `<span class="badge badge-stress">${s}${domTag}</span>`;
-              }).join('');
-            } else if (va.dominant_stress === 'Unknown') {
-              stressBadge = '<span class="badge">Stress: N/A</span>';
-            }
-          }
-
-          vitalsHtml = `<div class="mono">EDA:${eda} | HR:${hr} | RR:${rr} | Temp:${bt}</div>`
-            + `<div style="margin-top:3px;">${comfortBadge}${stressBadge}</div>`;
-        }
-
-        let statText = '<span style="color:#9ca3af;">Waiting for capture...</span>';
-        if (rData) {
-          const sc = (rData.adaptability_score !== undefined) ? rData.adaptability_score : '-';
-          const pr = (priorityByMod[mod] !== undefined) ? priorityByMod[mod] : '-';
-          const nv = Array.isArray(rData.norm_vec) ? `[${rData.norm_vec.join(', ')}]` : '-';
-          statText = `<div class="mono">Score: ${sc} | Pri: ${pr}</div><div class="mono" style="color:#9ca3af;">Z: ${nv}</div>`;
-        }
-
-        const disAttr = isLocked ? 'disabled title="Room locked while recording"' : '';
-        const rec = recs[mod];
-        let recHtml = '<span class="badge badge-ok">Steady (No move)</span>';
-        if (rec) {
-          recHtml = `<div style="color:#fbbf24;font-weight:600;">Move → ${rec.to_mid}</div>`
-            + `<div style="font-size:11px;color:#d1d5db;">${rec.reason}</div>`
-            + `<button class="move-btn" ${disAttr} onclick="assign('${mod}','${rec.to_mid}','manual')">Apply Move</button>`;
-        }
-
-        const btns = mids.map(m => {
-          const cls = (cur.mid_id === m && cur.mode === 'manual') ? 'active' : '';
-          return `<button class="${cls}" ${disAttr} onclick="assign('${mod}','${m}','manual')">${m}</button>`;
-        }).join('') + `<button class="auto ${cur.mode === 'auto' ? 'active' : ''}" ${disAttr} onclick="assign('${mod}','${cur.mid_id}','auto')">AUTO (BLE)</button>`;
-
-        return `<tr>
-          <td><b>${mod}</b></td>
-          <td>${captureBadge}</td>
-          <td>${cur.mid_id}</td>
-          <td>${modeHtml}</td>
-          <td class="rssi">${rssiText}</td>
-          <td>${vitalsHtml}</td>
-          <td>${statText}</td>
-          <td>${recHtml}</td>
-          <td>${btns}</td>
-        </tr>`;
-      }).join('');
-
-      const cardsDiv = document.getElementById('room-cards');
-      cardsDiv.innerHTML = mids.map(m => {
-        const info = data.middle_nodes[m];
-        if (!info) {
-          return `<div class="card"><div class="card-head"><b>${m}</b><span class="badge">offline</span></div><div style="color:#9ca3af;font-size:12px;">Waiting for Middle Pi heartbeat...</div></div>`;
-        }
-        const ctx = info.context_analysis || {};
-        const ctrl = ctx.room_control || {};
-        const cos = ctx.cosine_similarity || {};
-        const sVecs = ctx.strategy_vectors || {};
-        const ewVec = sVecs['Equality With Weight'] || [0, 0, 0, 0];
-        const statusBadge = ctx.conflict_detected
-          ? `<span class="badge badge-warn">CONFLICT DETECTED (${ctx.conflict_outlier || '-'})</span>`
-          : `<span class="badge badge-ok">STEADY STATE</span>`;
-
-        const activeList = (info.active_module_ids || []).map(id => {
-          const isRec = (info.recording_module_ids || []).includes(id);
-          return isRec ? `<b>${id} (REC)</b>` : id;
-        }).join(', ') || 'None';
-
-        return `<div class="card">
-          <div class="card-head"><b>${m} (${info.ip})</b>${statusBadge}</div>
-          <div class="kv"><span class="lbl">Active MODs</span><span class="mono">${activeList}</span></div>
-          <div class="kv"><span class="lbl">Room Temp / Crowdedness</span><span class="mono">${info.rm_temp_c}°C / ${ctx.crowdedness ?? 0}</span></div>
-          <div class="kv"><span class="lbl">AC Target / Device Setting</span><span class="mono"><b>${ctrl.ac_target_temp_c ?? '-'}°C</b> / <b>${ctrl.device_setting ?? 'Random'}</b></span></div>
-          <div class="kv"><span class="lbl">Group Context (Eq+Wt)</span><span class="mono">[${ewVec.join(', ')}]</span></div>
-          <div class="kv"><span class="lbl">CosSim (Equality)</span><span class="mono">${fmtSim(cos['Equality'])}</span></div>
-          <div class="kv"><span class="lbl">CosSim (Eq With Weight)</span><span class="mono">${fmtSim(cos['Equality With Weight'])}</span></div>
-          <div class="kv"><span class="lbl">CosSim (Fairness)</span><span class="mono">${fmtSim(cos['Fairness'])}</span></div>
-        </div>`;
-      }).join('');
-    }
-    refresh();
-    setInterval(refresh, 3000);
-    setInterval(renderDashboard, 1000);
-  </script>
+    return `<div class="card">
+      <div class="card-hdr"><span>${m.middle_id} (${m.ip})</span>${badge}</div>
+      <div class="kv"><span>Active MODs</span><span>${activeMods}</span></div>
+      <div class="kv"><span>Room Temp / Crowdedness</span><span>${m.rm_temp_c}° C${srcTag} / ${crowd}</span></div>
+      <div class="kv"><span>AC Target / Device Setting</span><span>${ctrl.ac_target_temp_c ?? 22}°C / ${ctrl.device_setting ?? 'Standby'}</span></div>
+      <div class="kv"><span>Group Context (Eq+Wt)</span><span>[${ew.join(', ')}]</span></div>
+      <div class="kv"><span>CosSim (Equality)</span><span>${cos.Equality ?? '-'}</span></div>
+      <div class="kv"><span>CosSim (Eq With Weight)</span><span>${cos['Equality With Weight'] ?? '-'}</span></div>
+      <div class="kv"><span>CosSim (Fairness)</span><span>${cos.Fairness ?? '-'}</span></div>
+    </div>`;
+  }).join('');
+  document.getElementById('room-cards').innerHTML = cardsHtml;
+}
+refresh();
+setInterval(refresh, 2500);
+</script>
 </body>
-</html>"""
+</html>
+"""
 
 
 class TopHandler(BaseHTTPRequestHandler):
@@ -1131,42 +588,70 @@ class TopHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
-    def _send_html(self, code: int, html: str):
+    def _send_html(self, html: str):
         raw = html.encode("utf-8")
-        self.send_response(code)
+        self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
 
     def do_GET(self):
-        parsed = urlparse(self.path)
-        if parsed.path in ("/", "/api/status"):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        qs = urllib.parse.parse_qs(parsed.query)
+
+        if path in ("/", "/rooms"):
+            self._send_html(DASHBOARD_HTML)
+            return
+
+        if path in ("/api/state", "/api/rooms", "/api/status"):
             with state_lock:
-                snapshot = build_global_snapshot_locked()
-            self._send_json(200, snapshot)
-        elif parsed.path == "/rooms":
-            self._send_html(200, render_rooms_html())
-        elif parsed.path == "/api/export.zip":
-            zip_bytes = build_export_zip_bytes()
-            fname = f"vital_experiment_records_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+                snap = build_cluster_snapshot_locked()
+            self._send_json(200, snap)
+            return
+
+        if path in ("/api/directory", "/api/module"):
+            mod_id = (qs.get("module_id") or [""])[0].strip().upper()
+            with state_lock:
+                snap = build_cluster_snapshot_locked()
+                p_info = snap["participants"].get(mod_id, {})
+                assigned = p_info.get("assigned_room", "UNASSIGNED")
+                mid_url = snap["directory"].get(assigned, "")
+                rec = p_info.get("recommendation", {"should_move": False, "target_room": None})
+            self._send_json(
+                200,
+                {
+                    "top_id": TOP_ID,
+                    "directory": snap["directory"],
+                    "assigned_room": assigned,
+                    "middle_url": mid_url,
+                    "recommendation": rec,
+                },
+            )
+            return
+
+        if path == "/api/export_zip":
+            OUT_DIR.mkdir(exist_ok=True)
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for p in sorted(OUT_DIR.glob("*")):
+                    if p.is_file():
+                        zf.write(p, arcname=p.name)
+                with state_lock:
+                    snap = build_cluster_snapshot_locked()
+                zf.writestr("cluster_snapshot.json", json.dumps(snap, indent=2))
+            raw = buf.getvalue()
+            fname = f"vital_experiment_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
             self.send_response(200)
             self.send_header("Content-Type", "application/zip")
             self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
-            self.send_header("Content-Length", str(len(zip_bytes)))
+            self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
-            self.wfile.write(zip_bytes)
-        elif parsed.path == "/api/route":
-            qs = parse_qs(parsed.query)
-            mod_id = str(qs.get("mod_id", [""])[0]).strip().upper()
-            if not mod_id:
-                self._send_json(400, {"error": "Missing mod_id query param"})
-                return
-            with state_lock:
-                route_info = resolve_route_locked(mod_id)
-            self._send_json(200, route_info)
-        else:
-            self._send_json(404, {"error": "Not found"})
+            self.wfile.write(raw)
+            return
+
+        self._send_json(404, {"error": "Not found"})
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
@@ -1179,168 +664,157 @@ class TopHandler(BaseHTTPRequestHandler):
         client_ip = self.client_address[0]
         now = time.time()
 
-        if self.path == "/api/reset":
-            res = reset_all_cluster_data()
-            code = 200 if res.get("ok") else 409
-            self._send_json(code, res)
-            return
-
-        if self.path == "/api/raw_session":
-            mod_id = str(payload.get("mod_id", "UNKNOWN")).strip().upper()
-            raw_fname = str(payload.get("filename", "")).strip()
-            csv_content = str(payload.get("csv_content", ""))
-            if not raw_fname or not csv_content:
-                self._send_json(400, {"error": "Provide mod_id, filename, and csv_content"})
-                return
-            safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", Path(raw_fname).name)
-            with state_lock:
-                RAW_SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-                dest = RAW_SESSIONS_DIR / safe_name
-                dest.write_text(csv_content, encoding="utf-8")
-            print(f"[{TOP_ID}] Saved raw 5Hz session CSV from {mod_id}: {dest}")
-            self._send_json(200, {"ok": True, "saved_as": str(dest)})
-            return
-
-        if self.path == "/api/recheck":
-            with state_lock:
-                prune_stale_middles_locked(now)
-                all_mods = set(room_assignments.keys()) | set(ble_observations.keys())
-                for mod_id in sorted(all_mods):
-                    if room_assignments.get(mod_id, {}).get("mode", "auto") == "auto":
-                        evaluate_ble_routing_locked(mod_id, now, force_recheck=True, source_tag="RECHECK")
-                snapshot = build_global_snapshot_locked()
-            self._send_json(200, {"ok": True, "room_assignments": snapshot["room_assignments"]})
-            return
-
-        if self.path == "/api/assign":
-            mod_id = str(payload.get("mod_id", "")).strip().upper()
-            mid_id = str(payload.get("mid_id", "")).strip().upper()
-            mode = str(payload.get("mode", "manual")).strip().lower()
-            if not mod_id or not mid_id:
-                self._send_json(400, {"ok": False, "error": "Provide mod_id and mid_id"})
-                return
-            if mode not in ("manual", "auto"):
-                mode = "manual"
-
-            with state_lock:
-                if is_module_recording_locked(mod_id):
-                    self._send_json(
-                        409,
-                        {
-                            "ok": False,
-                            "error": f"Room is locked while {mod_id} is recording. Wait until capture finishes.",
-                        },
-                    )
-                    return
-
-                prev_mid = (room_assignments.get(mod_id) or {}).get("mid_id", "")
-                room_assignments[mod_id] = {
-                    "mid_id": mid_id,
-                    "mode": mode,
-                    "updated_at": datetime.now().isoformat(timespec="seconds"),
-                }
-                if prev_mid != mid_id:
-                    latest_move_recommendations.pop(mod_id, None)
-                if mode == "auto":
-                    evaluate_ble_routing_locked(mod_id, now, force_recheck=True, source_tag="AUTO-BTN")
-                else:
-                    save_assignments_locked()
-                    log_routing_event_locked("MANUAL_ASSIGN", mod_id, prev_mid, mid_id, "manual", "UI_OR_API", now)
-                    print(f"[{TOP_ID}] ROOM ASSIGN (MANUAL): {mod_id} -> {mid_id}")
-                route_info = resolve_route_locked(mod_id)
-
-            self._send_json(200, route_info)
-            return
-
         if self.path == "/api/ble_scan":
             mid_id = str(payload.get("middle_id", "")).strip().upper()
-            readings = payload.get("readings", {})
+            readings = payload.get("readings") or {}
             if not mid_id or not isinstance(readings, dict):
                 self._send_json(400, {"error": "Invalid ble_scan payload"})
                 return
-
-            ts_iso = datetime.now().isoformat(timespec="seconds")
             with state_lock:
-                for mod_raw, rssi_val in readings.items():
-                    mod_id = str(mod_raw).strip().upper()
-                    try:
-                        rssi = float(rssi_val)
-                    except (TypeError, ValueError):
-                        continue
-                    ble_observations.setdefault(mod_id, {})[mid_id] = {"rssi": rssi, "ts": now}
-                    assign_info = room_assignments.get(mod_id, {})
-                    append_csv_row_locked(
-                        BLE_RSSI_CSV,
-                        BLE_RSSI_HEADER,
-                        [
-                            ts_iso,
-                            mod_id,
-                            mid_id,
-                            rssi,
-                            assign_info.get("mid_id", ""),
-                            assign_info.get("mode", "auto"),
-                        ],
-                    )
-                    evaluate_ble_routing_locked(mod_id, now, force_recheck=False, source_tag="BLE-SCAN")
-
+                for raw_mod, rssi in readings.items():
+                    mod_id = str(raw_mod).strip().upper()
+                    ensure_participant_locked(mod_id)
+                    ble_table.setdefault(mod_id, {})[mid_id] = {
+                        "rssi": float(rssi),
+                        "ts": now,
+                    }
             self._send_json(200, {"ok": True})
             return
 
-        if self.path != "/api/middle":
-            self._send_json(404, {"error": "Not found"})
+        if self.path == "/api/middle":
+            mid_id = str(payload.get("middle_id", "")).strip().upper()
+            if not mid_id:
+                self._send_json(400, {"error": "Missing middle_id"})
+                return
+            listen_port = int(payload.get("listen_port", 8001))
+            event_type = str(payload.get("event", "sync"))
+            trigger_mod = str(payload.get("trigger_module", "")).strip().upper()
+
+            with state_lock:
+                middle_nodes[mid_id] = {
+                    "middle_id": mid_id,
+                    "ip": client_ip,
+                    "url": f"http://{client_ip}:{listen_port}",
+                    "last_seen": now,
+                    "rm_temp_c": payload.get("rm_temp_c", 23.0),
+                    "rm_temp_source": payload.get("rm_temp_source", "default"),
+                    "recording_module_ids": payload.get("recording_module_ids", []),
+                    "context_analysis": payload.get("context_analysis", {}),
+                }
+
+                b_nodes = payload.get("bottom_nodes") or {}
+                for raw_mod, b_info in b_nodes.items():
+                    mod_id = str(raw_mod).strip().upper()
+                    p = ensure_participant_locked(mod_id)
+                    p["ip"] = b_info.get("ip", p["ip"])
+                    p["last_seen"] = now
+                    p["is_recording"] = bool(b_info.get("is_recording", False))
+                    p["recording_elapsed_s"] = float(b_info.get("recording_elapsed_s", 0.0))
+                    p["sim_mode"] = bool(b_info.get("sim_mode", False))
+
+                    if p["assigned_room"] == "UNASSIGNED":
+                        assign_room_locked(mod_id, mid_id, source="initial-attach")
+
+                    latest_r = b_info.get("latest_reading")
+                    if isinstance(latest_r, dict):
+                        p["latest_reading"] = latest_r
+                        r_ts = str(latest_r.get("timestamp") or payload.get("timestamp") or "")
+                        if event_type == "reading" or (trigger_mod == mod_id and r_ts):
+                            move_cooldown.record_capture_round(mod_id, r_ts)
+
+                if event_type == "reading" and trigger_mod:
+                    rec = compute_recommendation_locked(trigger_mod)
+                    ctx = payload.get("context_analysis") or {}
+                    append_event_csv(
+                        {
+                            "timestamp": payload.get("timestamp", datetime.now().isoformat(timespec="seconds")),
+                            "event": event_type,
+                            "middle_id": mid_id,
+                            "module_id": trigger_mod,
+                            "assigned_room": participants.get(trigger_mod, {}).get("assigned_room", ""),
+                            "rm_temp_c": payload.get("rm_temp_c", ""),
+                            "conflict_detected": ctx.get("conflict_detected", False),
+                            "conflict_outlier": ctx.get("conflict_outlier", ""),
+                            "recommended_room": rec.get("target_room") or "",
+                            "reason": rec.get("reason") or rec.get("label") or "",
+                        }
+                    )
+
+            self._send_json(200, {"ok": True, "top_id": TOP_ID})
             return
 
-        mid = str(payload.get("middle_id", "")).strip().upper()
-        if not mid:
-            self._send_json(400, {"error": "Missing middle_id"})
-            return
-
-        event_type = payload.get("event", "unknown")
-        listen_port = int(payload.get("listen_port", 8001))
-
-        with state_lock:
-            is_new = mid not in middle_states
-            middle_states[mid] = {
-                "last_seen": now,
-                "ip": client_ip,
-                "port": listen_port,
-                "packet": payload,
-            }
-            snapshot = build_global_snapshot_locked()
-            LATEST_JSON.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
-            record_experiment_logs_locked(mid, event_type, payload, snapshot, now)
-
-        if is_new:
-            print(f"[{TOP_ID}] Middle Pi connected: {mid} ({client_ip}:{listen_port})")
-
-        if event_type == "reading":
-            print("\n" + "=" * 60)
-            print(f"[{TOP_ID}] UPDATE from {mid} (trigger: {payload.get('trigger_module')})")
-            for m_key, m_val in snapshot["middle_nodes"].items():
-                ctx = m_val.get("context_analysis") or {}
-                print(
-                    f"  • {m_key} (RmTemp={m_val['rm_temp_c']}°C): {m_val['active_bottom_count']} bottom Pis {m_val['active_module_ids']} "
-                    f"| Ctrl={ctx.get('room_control')} | Conflict={ctx.get('conflict_detected')}"
+        if self.path == "/api/move":
+            mod_id = str(payload.get("module_id", "")).strip().upper()
+            target_room = str(payload.get("target_room", "")).strip().upper()
+            if not mod_id or not target_room:
+                self._send_json(400, {"error": "Missing module_id or target_room"})
+                return
+            with state_lock:
+                p = ensure_participant_locked(mod_id)
+                p["mode"] = "manual"
+                assign_room_locked(mod_id, target_room, source="apply-move")
+                append_event_csv(
+                    {
+                        "timestamp": datetime.now().isoformat(timespec="seconds"),
+                        "event": "apply_move",
+                        "middle_id": target_room,
+                        "module_id": mod_id,
+                        "assigned_room": target_room,
+                        "reason": "User clicked Apply Move",
+                    }
                 )
-            if snapshot["move_recommendations"]:
-                print(f"  => MOVE RECOMMENDATIONS: {snapshot['move_recommendations']}")
-            print("=" * 60 + "\n")
+            self._send_json(200, {"ok": True, "module_id": mod_id, "assigned_room": target_room})
+            return
 
-        self._send_json(200, {"ok": True, "top_id": TOP_ID})
+        if self.path == "/api/switch_room":
+            mod_id = str(payload.get("module_id", "")).strip().upper()
+            mode = str(payload.get("mode", "manual")).strip().lower()
+            room = str(payload.get("room", "")).strip().upper()
+            if not mod_id:
+                self._send_json(400, {"error": "Missing module_id"})
+                return
+            with state_lock:
+                p = ensure_participant_locked(mod_id)
+                p["mode"] = "auto" if mode == "auto" else "manual"
+                if p["mode"] == "manual" and room:
+                    assign_room_locked(mod_id, room, source="manual-switch")
+                elif p["mode"] == "auto":
+                    run_auto_ble_routing_locked(now, target_mod=mod_id)
+            self._send_json(200, {"ok": True, "module_id": mod_id, "mode": p["mode"]})
+            return
+
+        if self.path == "/api/check_closest":
+            with state_lock:
+                moved = run_auto_ble_routing_locked(now)
+            self._send_json(200, {"ok": True, "moved": moved})
+            return
+
+        if self.path == "/api/reset":
+            with state_lock:
+                mid_urls = [m["url"] for m in middle_nodes.values() if m.get("url")]
+                for p in participants.values():
+                    p["latest_reading"] = None
+                    p["is_recording"] = False
+                    p["recording_elapsed_s"] = 0.0
+                move_cooldown.clear()
+            for url in mid_urls:
+                post_json(f"{url}/api/reset", {}, timeout=2.5)
+            self._send_json(200, {"ok": True})
+            return
+
+        self._send_json(404, {"error": "Not found"})
 
 
 def main():
     OUT_DIR.mkdir(exist_ok=True)
-    RAW_SESSIONS_DIR.mkdir(exist_ok=True)
-    load_assignments()
     stop_event = threading.Event()
-    threading.Thread(target=periodic_auto_route_worker, args=(stop_event,), daemon=True).start()
+    threading.Thread(target=auto_ble_worker, args=(stop_event,), daemon=True).start()
 
     server = ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), TopHandler)
-    print(f"[{TOP_ID}] Top Coordinator listening on 0.0.0.0:{LISTEN_PORT}")
-    print(f"[{TOP_ID}] Live JSON endpoint : http://0.0.0.0:{LISTEN_PORT}/api/status")
-    print(f"[{TOP_ID}] Export ZIP endpoint: http://0.0.0.0:{LISTEN_PORT}/api/export.zip")
-    print(f"[{TOP_ID}] Room Switcher UI   : http://0.0.0.0:{LISTEN_PORT}/rooms (Auto-check every {AUTO_CHECK_INTERVAL_S:.0f}s)")
+    print(
+        f"[{TOP_ID}] Top Cluster Coordinator listening on 0.0.0.0:{LISTEN_PORT} "
+        f"(Move cooldown: {MOVE_COOLDOWN_ROUNDS} rounds or {int(MOVE_COOLDOWN_S // 60)} min)"
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
