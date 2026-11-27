@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 # Middle-Layer Raspberry Pi Aggregator (3 Middle Pis: MID-01, MID-02, MID-03)
-# Receives from 0~10 dynamic Bottom Pis -> Computes Room Context Vectors, Cosine Similarities,
+# Reads live room temperature from connected BBC micro:bit via USB Serial,
+# receives from 0~10 dynamic Bottom Pis -> Computes Room Context Vectors, Cosine Similarities,
 # Conflict Detection, and Room Device/HVAC Controls -> Forwards to Top Pi immediately on state changes.
 
 from __future__ import annotations
 
 import asyncio
 import csv
+import glob
 import json
 import math
 import os
+import re
 import shutil
 import socket
 import threading
@@ -30,6 +33,11 @@ ACTIVE_TIMEOUT_S = 40.0     # Bottom Pi removed from active list if silent > 40s
 SYNC_INTERVAL_S = 15.0      # Periodic heartbeat/roster sync to Top Pi
 BLE_SCAN_INTERVAL_S = 3.0   # BLE proximity scan cadence (if bleak is installed)
 
+# --- MICRO:BIT SERIAL CONFIGURATION ---
+MICROBIT_PORT = os.getenv("MICROBIT_PORT", "").strip()  # Auto-detects /dev/ttyACM* if empty
+MICROBIT_BAUD = int(os.getenv("MICROBIT_BAUD", "115200"))
+MICROBIT_STALE_S = float(os.getenv("MICROBIT_STALE_S", "30.0"))
+
 # --- CONTEXT & ENVIRONMENTAL CONTROL PARAMETERS ---
 INDICATOR_WEIGHTS = [0.4, 0.3, 0.2, 0.1]
 COS_SIM_CONFLICT_THRESHOLD = 0.95
@@ -47,10 +55,52 @@ RECEIVED_HEADER = [
 
 state_lock = threading.Lock()
 active_nodes: dict[str, dict] = {}
+latest_rm_temp_c: float = DEFAULT_RM_TEMP_C
+latest_rm_temp_source: str = "default"
+latest_rm_temp_ts: float = 0.0
 
 
-def read_room_temperature() -> float:
-    return round(DEFAULT_RM_TEMP_C, 2)
+def read_room_temperature() -> tuple[float, str]:
+    now = time.time()
+    with state_lock:
+        if latest_rm_temp_source == "microbit" and (now - latest_rm_temp_ts) <= MICROBIT_STALE_S:
+            return round(latest_rm_temp_c, 2), "microbit"
+        return round(DEFAULT_RM_TEMP_C, 2), "default"
+
+
+def _parse_microbit_temp(line: str) -> float | None:
+    text = line.strip()
+    if not text:
+        return None
+    val: float | None = None
+    if text.startswith("{"):
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, dict):
+                for key in ("rm_temp_c", "temp", "temperature", "t"):
+                    if key in obj and obj[key] is not None:
+                        val = float(obj[key])
+                        break
+        except (ValueError, TypeError):
+            return None
+    else:
+        m = re.search(r"(-?\d+(?:\.\d+)?)", text)
+        if m:
+            try:
+                val = float(m.group(1))
+            except ValueError:
+                return None
+
+    if val is not None and -10.0 <= val <= 60.0:
+        return round(val, 2)
+    return None
+
+
+def _detect_microbit_port() -> str:
+    if MICROBIT_PORT:
+        return MICROBIT_PORT
+    candidates = sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
+    return candidates[0] if candidates else ""
 
 
 def cosine_similarity(v1: list[float], v2: list[float]) -> float:
@@ -214,7 +264,13 @@ def build_group_packet_locked(event_type: str, trigger_module: str | None = None
     now = time.time()
     prune_stale_nodes_locked(now)
 
-    rm_temp_c = read_room_temperature()
+    if latest_rm_temp_source == "microbit" and (now - latest_rm_temp_ts) <= MICROBIT_STALE_S:
+        rm_temp_c = round(latest_rm_temp_c, 2)
+        rm_temp_source = "microbit"
+    else:
+        rm_temp_c = round(DEFAULT_RM_TEMP_C, 2)
+        rm_temp_source = "default"
+
     context_analysis = compute_room_context_locked(rm_temp_c)
 
     readings = [
@@ -239,6 +295,7 @@ def build_group_packet_locked(event_type: str, trigger_module: str | None = None
         "event": event_type,
         "trigger_module": trigger_module,
         "rm_temp_c": rm_temp_c,
+        "rm_temp_source": rm_temp_source,
         "active_bottom_count": len(active_nodes),
         "reporting_bottom_count": len(readings),
         "active_module_ids": sorted(active_nodes.keys()),
@@ -269,6 +326,62 @@ def forward_to_top(packet: dict) -> bool:
     if not top_url:
         return False
     return post_json(f"{top_url}/api/middle", packet)
+
+
+def microbit_serial_worker(stop_event: threading.Event):
+    global latest_rm_temp_c, latest_rm_temp_source, latest_rm_temp_ts
+    try:
+        import serial  # type: ignore
+    except ImportError:
+        print(f"[{MIDDLE_ID}] pyserial not installed; using default RmTemp={DEFAULT_RM_TEMP_C}°C.")
+        return
+
+    warned_missing = False
+    while not stop_event.is_set():
+        port = _detect_microbit_port()
+        if not port:
+            if not warned_missing:
+                print(f"[{MIDDLE_ID}] No micro:bit serial port found; waiting...")
+                warned_missing = True
+            stop_event.wait(3.0)
+            continue
+
+        warned_missing = False
+        first_reading = True
+        last_logged_temp: float | None = None
+        try:
+            with serial.Serial(port, MICROBIT_BAUD, timeout=2.0) as ser:
+                print(f"[{MIDDLE_ID}] micro:bit serial connected on {port} @ {MICROBIT_BAUD} baud")
+                while not stop_event.is_set():
+                    raw = ser.readline()
+                    if not raw:
+                        continue
+                    line = raw.decode("utf-8", errors="ignore").strip()
+                    temp_val = _parse_microbit_temp(line)
+                    if temp_val is None:
+                        continue
+
+                    now = time.time()
+                    sync_pkt = None
+                    with state_lock:
+                        latest_rm_temp_c = temp_val
+                        latest_rm_temp_source = "microbit"
+                        latest_rm_temp_ts = now
+                        if first_reading:
+                            sync_pkt = build_group_packet_locked(event_type="microbit_connected")
+
+                    if first_reading:
+                        print(f"[{MIDDLE_ID}] Live micro:bit temperature active: {temp_val}°C")
+                        last_logged_temp = temp_val
+                        first_reading = False
+                        if sync_pkt is not None:
+                            threading.Thread(target=forward_to_top, args=(sync_pkt,), daemon=True).start()
+                    elif last_logged_temp is not None and abs(temp_val - last_logged_temp) >= 0.5:
+                        print(f"[{MIDDLE_ID}] micro:bit RmTemp updated: {temp_val}°C")
+                        last_logged_temp = temp_val
+        except Exception as exc:
+            print(f"[{MIDDLE_ID}] micro:bit serial disconnected ({exc}); retrying in 3s...")
+            stop_event.wait(3.0)
 
 
 def reset_middle_and_bottoms() -> dict:
@@ -507,6 +620,7 @@ class MiddleHandler(BaseHTTPRequestHandler):
                 f"[{MIDDLE_ID}] Reading from {mod_id} | Active={packet['active_bottom_count']} "
                 f"| Avg(EDA={gs['mean_eda_peaks_2min']}, BPM={gs['mean_bpm']}, "
                 f"Resp={gs['mean_resp_rate_min']}, BodyTemp={gs['mean_temp_c']}) "
+                f"| RmTemp={packet['rm_temp_c']}°C ({packet['rm_temp_source']}) "
                 f"| Ctrl={ctx['room_control']} | Conflict={ctx['conflict_detected']} "
                 f"-> TopPi: {'SENT' if sent_top else 'UNREACHABLE'}"
             )
@@ -519,11 +633,13 @@ class MiddleHandler(BaseHTTPRequestHandler):
 def main():
     OUT_DIR.mkdir(exist_ok=True)
     stop_event = threading.Event()
+    threading.Thread(target=microbit_serial_worker, args=(stop_event,), daemon=True).start()
     threading.Thread(target=periodic_top_sync, args=(stop_event,), daemon=True).start()
     threading.Thread(target=ble_scanner_worker, args=(stop_event,), daemon=True).start()
 
+    rm_temp, rm_src = read_room_temperature()
     server = ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), MiddleHandler)
-    print(f"[{MIDDLE_ID}] Listening on 0.0.0.0:{LISTEN_PORT} (RmTemp={read_room_temperature()}°C)")
+    print(f"[{MIDDLE_ID}] Listening on 0.0.0.0:{LISTEN_PORT} (RmTemp={rm_temp}°C, source={rm_src})")
     print(f"[{MIDDLE_ID}] Target Top Pi: {get_top_url() or 'Not configured (set top_url.txt)'}")
     try:
         server.serve_forever()
