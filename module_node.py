@@ -593,14 +593,17 @@ def run_respiration_tracker(stop_event: threading.Event, result_container: dict,
 
 
 class SimulatedMicrobit:
-    """Emulates micro:bit serial output (5 Hz GSR, BPM, Temp) with keyboard and HTTP triggers."""
+    """Emulates micro:bit serial output (5 Hz GSR, BPM, Temp) and yields if a real micro:bit is plugged in."""
 
-    def __init__(self):
+    def __init__(self, auto_detect_hw: bool = True):
         self.boot_t = time.time()
         self.recording = False
         self.rec_start_t = 0.0
         self.pending_cmd: str | None = None
         self.lock = threading.Lock()
+        self.auto_detect_hw = auto_detect_hw
+        self.enabled = False
+        self.last_hw_check = 0.0
         self.base_gsr = random.randint(610, 670)
         self.base_bpm = random.randint(68, 82)
         self.base_temp_adc = random.randint(512, 535)
@@ -621,6 +624,8 @@ class SimulatedMicrobit:
 
     def toggle(self):
         with self.lock:
+            if not self.enabled:
+                return
             if self.recording:
                 self.recording = False
                 self.pending_cmd = "#STOP"
@@ -650,6 +655,10 @@ class SimulatedMicrobit:
                 return cmd
 
         if not self.recording:
+            if self.auto_detect_hw and (time.time() - self.last_hw_check) >= 2.0:
+                self.last_hw_check = time.time()
+                if find_port() is not None:
+                    return "__SWITCH_TO_HW__"
             time.sleep(0.1)
             return ""
 
@@ -670,7 +679,7 @@ class SimulatedMicrobit:
         return f"{mb_ms},{gsr},{bpm},{temp_raw}"
 
 
-def start_control_http_server(port: int, sim_ref: SimulatedMicrobit | None = None):
+def start_control_http_server(port: int, sim_ref: SimulatedMicrobit):
     """Always-on HTTP control server for /reset (all modes) and /start, /stop (sim mode)."""
 
     class NodeControlHandler(BaseHTTPRequestHandler):
@@ -680,13 +689,13 @@ def start_control_http_server(port: int, sim_ref: SimulatedMicrobit | None = Non
                 trigger_immediate_heartbeat()
                 self._reply(200, {"ok": True, "module_id": MODULE_ID})
             elif self.path == "/start":
-                if sim_ref is None:
+                if not sim_ref.enabled:
                     self._reply(400, {"error": "Hardware micro:bit attached; press Button A to start"})
                 else:
                     sim_ref.trigger_start()
                     self._reply(200, {"status": "started", "module_id": MODULE_ID})
             elif self.path == "/stop":
-                if sim_ref is None:
+                if not sim_ref.enabled:
                     self._reply(400, {"error": "Hardware micro:bit attached; press Button B to stop"})
                 else:
                     sim_ref.trigger_stop()
@@ -814,11 +823,10 @@ def finalize_session(rows: list[tuple], resp_result: dict, wall_duration_s: floa
             "1" if sent_ok else "0",
         ])
 
-    # Immediately fetch Top Pi's updated movement recommendation and push to micro:bit LED
     sync_dynamic_route(force_led=True)
 
 
-def run_capture_loop(read_line_fn, sim_mode: bool, hb_stop: threading.Event):
+def run_capture_loop(read_line_fn, sim_mode: bool):
     f = writer = None
     rows = []
     session_start_wall = 0.0
@@ -831,9 +839,18 @@ def run_capture_loop(read_line_fn, sim_mode: bool, hb_stop: threading.Event):
 
     try:
         while True:
-            line = read_line_fn()
+            try:
+                line = read_line_fn()
+            except serial.SerialException as exc:
+                print(f"[{MODULE_ID}] Serial connection lost ({exc}). Reconnecting...")
+                break
+
             if not line:
                 continue
+
+            if line == "__SWITCH_TO_HW__":
+                print(f"[{MODULE_ID}] USB micro:bit detected — switching from simulation to hardware sensors.")
+                break
 
             if line == "#START":
                 if f:
@@ -902,16 +919,11 @@ def run_capture_loop(read_line_fn, sim_mode: bool, hb_stop: threading.Event):
                 if sim_mode and len(rows) % 10 == 0:
                     print(f"  [SIM] samples={len(rows)} | gsr={gsr}, bpm={bpm}, temp={temp_c:.2f}°C")
 
-    except KeyboardInterrupt:
-        print("\nExiting.")
-        hb_stop.set()
-        if resp_stop_event:
-            resp_stop_event.set()
     finally:
         set_capture_state(False, sim_mode=sim_mode)
         send_microbit_led_cmd("CLEAR", force=True)
-        hb_stop.set()
-        stop_ble_beacon()
+        if resp_stop_event:
+            resp_stop_event.set()
         if f:
             f.close()
 
@@ -920,7 +932,6 @@ def main():
     global active_serial
     force_sim = "--sim" in sys.argv
     cli_args = [a for a in sys.argv[1:] if a != "--sim"]
-    port = None if force_sim else (cli_args[0] if cli_args else find_port())
 
     OUT_DIR.mkdir(exist_ok=True)
     load_personal_history()
@@ -930,32 +941,46 @@ def main():
     hb_stop = threading.Event()
     threading.Thread(target=heartbeat_worker, args=(hb_stop,), daemon=True).start()
 
-    mid_id, middle_url = get_active_route()
-    if port:
-        start_control_http_server(SIM_CONTROL_PORT, sim_ref=None)
-        print(f"[{MODULE_ID}] Connected to {port} @ {BAUD} baud.")
-        print(f"[{MODULE_ID}] Top Pi Directory: {get_top_url() or 'Unset'} | Active Room: {mid_id} ({middle_url or 'Unset'})")
-        print("Press Button A on the micro:bit to start a 2-minute capture...")
-        with serial.Serial(port, BAUD, timeout=1) as ser:
-            ser.reset_input_buffer()
-            with serial_lock:
-                active_serial = ser
-            try:
-                run_capture_loop(
-                    lambda: ser.readline().decode("utf-8", errors="ignore").strip(),
-                    sim_mode=False,
-                    hb_stop=hb_stop,
-                )
-            finally:
-                with serial_lock:
-                    active_serial = None
-    else:
-        sim = SimulatedMicrobit()
-        start_control_http_server(SIM_CONTROL_PORT, sim_ref=sim)
-        print(f"[{MODULE_ID}] no microbit — switching to simulation sensors")
-        print(f"[{MODULE_ID}] Top Pi Directory: {get_top_url() or 'Unset'} | Active Room: {mid_id} ({middle_url or 'Unset'})")
-        print(f"[{MODULE_ID}] Press Enter (or POST http://<PI-IP>:{SIM_CONTROL_PORT}/start & /stop) to toggle capture...")
-        run_capture_loop(sim.readline, sim_mode=True, hb_stop=hb_stop)
+    sim = SimulatedMicrobit(auto_detect_hw=not force_sim)
+    start_control_http_server(SIM_CONTROL_PORT, sim_ref=sim)
+
+    try:
+        while True:
+            port = None if force_sim else (cli_args[0] if cli_args else find_port())
+            mid_id, middle_url = get_active_route()
+
+            if port:
+                sim.enabled = False
+                print(f"[{MODULE_ID}] Connected to {port} @ {BAUD} baud.")
+                print(f"[{MODULE_ID}] Top Pi Directory: {get_top_url() or 'Unset'} | Active Room: {mid_id} ({middle_url or 'Unset'})")
+                print("Press Button A on the micro:bit to start a 2-minute capture...")
+                try:
+                    with serial.Serial(port, BAUD, timeout=0.5) as ser:
+                        ser.reset_input_buffer()
+                        with serial_lock:
+                            active_serial = ser
+                        try:
+                            run_capture_loop(
+                                lambda: ser.readline().decode("utf-8", errors="ignore").strip(),
+                                sim_mode=False,
+                            )
+                        finally:
+                            with serial_lock:
+                                active_serial = None
+                except serial.SerialException as exc:
+                    print(f"[{MODULE_ID}] Serial port {port} unavailable ({exc}); retrying in 2s...")
+                time.sleep(2.0)
+            else:
+                sim.enabled = True
+                print(f"[{MODULE_ID}] no microbit — switching to simulation sensors (auto-detecting USB micro:bit...)")
+                print(f"[{MODULE_ID}] Top Pi Directory: {get_top_url() or 'Unset'} | Active Room: {mid_id} ({middle_url or 'Unset'})")
+                print(f"[{MODULE_ID}] Press Enter (or POST http://<PI-IP>:{SIM_CONTROL_PORT}/start & /stop) to toggle capture...")
+                run_capture_loop(sim.readline, sim_mode=True)
+    except KeyboardInterrupt:
+        print("\nExiting.")
+    finally:
+        hb_stop.set()
+        stop_ble_beacon()
 
 
 if __name__ == "__main__":
