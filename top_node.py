@@ -1,14 +1,14 @@
+
 #!/usr/bin/env python3
 # Top-Layer Cluster Coordinator & Dynamic Room Router (1 Top Pi <- 1~3 Middle Pis <- 0~10 Bottom Pis each)
 # Aggregates room context vectors, tracks BLE proximity across rooms, recommends participant moves
-# with a post-move cooldown filter (rounds + elapsed time), logs experiment CSVs, and serves /rooms UI.
+# with a round-based post-move cooldown filter, logs experiment CSVs, and serves /rooms UI.
 
 from __future__ import annotations
 
 import csv
 import io
 import json
-import math
 import os
 import socket
 import threading
@@ -33,44 +33,66 @@ BLE_STALE_S = float(os.getenv("BLE_STALE_S", "20.0"))
 AUTO_BLE_INTERVAL_S = float(os.getenv("AUTO_BLE_INTERVAL_S", "15.0"))
 BLE_HYSTERESIS_DBM = float(os.getenv("BLE_HYSTERESIS_DBM", "4.0"))
 
-# Post-move cooldown filter: suppress repeat move suggestions for N capture rounds or M seconds
+# Post-move cooldown filter: suppress repeat move suggestions for N capture rounds
 MOVE_COOLDOWN_ROUNDS = int(os.getenv("MOVE_COOLDOWN_ROUNDS", "3"))
-MOVE_COOLDOWN_S = float(os.getenv("MOVE_COOLDOWN_S", "1800"))  # 1800s = 30 min, 3600s = 60 min
 
 COSINE_CONFLICT_THRESHOLD = float(os.getenv("COSINE_CONFLICT_THRESHOLD", "0.95"))
 BODY_TEMP_THRESHOLD_C = float(os.getenv("BODY_TEMP_THRESHOLD_C", "36.0"))
 
-EMOTION_LABELS = ["Anxiety", "Displeasure", "Anger"]
+
+def _reading_signature(r: dict | None) -> str:
+    if not isinstance(r, dict) or not r:
+        return ""
+    if r.get("timestamp"):
+        return str(r["timestamp"])
+    return json.dumps(
+        {
+            "eda": r.get("eda_peaks_2min"),
+            "bpm": r.get("mean_bpm"),
+            "rr": r.get("resp_rate_min"),
+            "temp": r.get("mean_temp_c"),
+            "score": r.get("adaptability_score"),
+        },
+        sort_keys=True,
+    )
 
 
 class MoveCooldownTracker:
-    """Prevents recommending another room move right after a participant moves."""
+    """Prevents recommending another room move until N capture rounds complete after a move."""
 
     def __init__(self):
-        # mod_id -> {"from_room": str, "to_room": str, "moved_at": float, "rounds": int, "last_reading_ts": str}
+        # mod_id -> {"from_room": str, "to_room": str, "rounds": int, "last_reading_sig": str}
         self._state: dict[str, dict] = {}
 
-    def record_move(self, mod_id: str, old_room: str | None, new_room: str | None):
+    def record_move(
+        self,
+        mod_id: str,
+        old_room: str | None,
+        new_room: str | None,
+        current_reading: dict | None = None,
+    ):
         if not old_room or not new_room or old_room == "UNASSIGNED" or old_room == new_room:
             return
         self._state[mod_id] = {
             "from_room": old_room,
             "to_room": new_room,
-            "moved_at": time.time(),
             "rounds": 0,
-            "last_reading_ts": "",
+            "last_reading_sig": _reading_signature(current_reading),
         }
         print(
             f"[{TOP_ID}] Cooldown started for {mod_id}: moved {old_room} -> {new_room} "
-            f"(locked for {MOVE_COOLDOWN_ROUNDS} rounds or {int(MOVE_COOLDOWN_S // 60)}m)"
+            f"(locked for {MOVE_COOLDOWN_ROUNDS} rounds)"
         )
 
-    def record_capture_round(self, mod_id: str, reading_ts: str):
+    def record_capture_round(self, mod_id: str, reading: dict | None):
         entry = self._state.get(mod_id)
-        if not entry or not reading_ts:
+        if not entry:
             return
-        if reading_ts != entry["last_reading_ts"]:
-            entry["last_reading_ts"] = reading_ts
+        sig = _reading_signature(reading)
+        if not sig:
+            return
+        if sig != entry["last_reading_sig"]:
+            entry["last_reading_sig"] = sig
             entry["rounds"] += 1
             print(
                 f"[{TOP_ID}] Cooldown round progress for {mod_id}: "
@@ -81,16 +103,11 @@ class MoveCooldownTracker:
         entry = self._state.get(mod_id)
         if not entry:
             return False, ""
-        elapsed_s = time.time() - entry["moved_at"]
         rounds = entry["rounds"]
-        if rounds >= MOVE_COOLDOWN_ROUNDS or elapsed_s >= MOVE_COOLDOWN_S:
+        if rounds >= MOVE_COOLDOWN_ROUNDS:
             del self._state[mod_id]
             return False, ""
-        rem_min = max(1, int((MOVE_COOLDOWN_S - elapsed_s + 59) // 60))
-        label = (
-            f"Cooldown: Moved -> {entry['to_room']} "
-            f"({rounds}/{MOVE_COOLDOWN_ROUNDS} rounds, {rem_min}m left)"
-        )
+        label = f"Cooldown: Moved -> {entry['to_room']} ({rounds}/{MOVE_COOLDOWN_ROUNDS} rounds)"
         return True, label
 
     def clear(self):
@@ -147,8 +164,9 @@ def ensure_participant_locked(mod_id: str) -> dict:
             "module_id": mod_id,
             "ip": "",
             "assigned_room": "UNASSIGNED",
-            "mode": "auto",  # "auto" or "manual"
+            "mode": "auto",
             "is_recording": False,
+            "recording_started_at": None,
             "recording_elapsed_s": 0.0,
             "sim_mode": False,
             "last_seen": time.time(),
@@ -163,7 +181,7 @@ def assign_room_locked(mod_id: str, new_room: str, source: str = ""):
     if not new_room or new_room == old_room:
         return
     p["assigned_room"] = new_room
-    move_cooldown.record_move(mod_id, old_room, new_room)
+    move_cooldown.record_move(mod_id, old_room, new_room, p.get("latest_reading"))
     if old_room != "UNASSIGNED" and old_room in middle_nodes:
         old_mid = middle_nodes[old_room]
         mid_url = old_mid.get("url", "").rstrip("/")
@@ -188,16 +206,11 @@ def get_fresh_ble_locked(mod_id: str, now: float) -> dict[str, float]:
 
 
 def run_auto_ble_routing_locked(now: float, target_mod: str | None = None) -> int:
-    """Assigns closest room based on BLE RSSI for modules in 'auto' mode (locked while recording)."""
     moved_count = 0
     mod_ids = [target_mod] if target_mod else sorted(participants.keys())
     for mod_id in mod_ids:
         p = participants.get(mod_id)
-        if not p:
-            continue
-        if p.get("mode", "auto") != "auto":
-            continue
-        if p.get("is_recording", False):
+        if not p or p.get("mode", "auto") != "auto" or p.get("is_recording", False):
             continue
 
         fresh_rssi = get_fresh_ble_locked(mod_id, now)
@@ -218,7 +231,6 @@ def run_auto_ble_routing_locked(now: float, target_mod: str | None = None) -> in
 
 
 def score_candidate_room(mod_id: str, p: dict, mid_id: str, mid_info: dict) -> float:
-    """Lower score is a better destination room for participant mod_id."""
     ctx = mid_info.get("context_analysis") or {}
     rm_temp = float(ctx.get("rm_temp_c", mid_info.get("rm_temp_c", 23.0)))
     crowdedness = float(ctx.get("crowdedness", mid_info.get("active_bottom_count", 0)))
@@ -228,13 +240,11 @@ def score_candidate_room(mod_id: str, p: dict, mid_id: str, mid_info: dict) -> f
     nv = r.get("norm_vec") or [0.0, 0.0, 0.0, 0.0]
     body_temp = float(r.get("mean_temp_c") or BODY_TEMP_THRESHOLD_C)
 
-    # Thermal alignment penalty
     if body_temp >= BODY_TEMP_THRESHOLD_C:
         thermal_pen = max(0.0, rm_temp - 22.0) * 0.6
     else:
         thermal_pen = max(0.0, 24.0 - rm_temp) * 0.6
 
-    # Emotional/sensory stress overlap penalty + crowdedness penalty
     emo_overlap = sum(float(nv[i]) * float(eq_wt[i]) for i in range(min(3, len(nv), len(eq_wt))))
     conflict_pen = 1.5 if ctx.get("conflict_detected") else 0.0
 
@@ -246,7 +256,6 @@ def compute_recommendation_locked(mod_id: str) -> dict:
     if not p:
         return {"should_move": False, "target_room": None, "label": "Steady (No move)", "reason": ""}
 
-    # 1. Post-move cooldown filter check
     in_cooldown, cooldown_label = move_cooldown.check(mod_id)
     if in_cooldown:
         return {
@@ -279,11 +288,7 @@ def compute_recommendation_locked(mod_id: str) -> dict:
     conflict_outlier = cur_ctx.get("conflict_outlier")
 
     other_rooms = [m_id for m_id in sorted(middle_nodes.keys()) if m_id != cur_room]
-    if not other_rooms:
-        return {"should_move": False, "target_room": None, "label": "Steady (No move)", "reason": ""}
-
-    # Trigger move evaluation if this participant is the conflict outlier or room is in conflict
-    if not conflict_detected:
+    if not other_rooms or not conflict_detected:
         return {"should_move": False, "target_room": None, "label": "Steady (No move)", "reason": ""}
 
     if conflict_outlier and conflict_outlier != mod_id and int(cur_ctx.get("crowdedness", 1)) > 1:
@@ -332,8 +337,17 @@ def build_cluster_snapshot_locked() -> dict:
     for mod_id in sorted(participants.keys()):
         p = participants[mod_id]
         online = (now - p["last_seen"]) <= BOTTOM_STALE_S
-        if p.get("is_recording"):
+        is_rec = bool(p.get("is_recording", False))
+        started_at = p.get("recording_started_at")
+        if is_rec:
             recording_now.append(mod_id)
+            if started_at is not None:
+                live_elapsed = max(float(p.get("recording_elapsed_s", 0.0)), now - float(started_at))
+            else:
+                live_elapsed = float(p.get("recording_elapsed_s", 0.0))
+        else:
+            live_elapsed = 0.0
+
         ble_signals = get_fresh_ble_locked(mod_id, now)
         rec = compute_recommendation_locked(mod_id)
         mods_out[mod_id] = {
@@ -343,24 +357,20 @@ def build_cluster_snapshot_locked() -> dict:
             "last_seen_ago_s": round(now - p["last_seen"], 1),
             "assigned_room": p.get("assigned_room", "UNASSIGNED"),
             "mode": p.get("mode", "auto"),
-            "is_recording": bool(p.get("is_recording", False)),
-            "recording_elapsed_s": float(p.get("recording_elapsed_s", 0.0)),
+            "is_recording": is_rec,
+            "recording_elapsed_s": round(live_elapsed, 1),
+            "sim_mode": bool(p.get("sim_mode", False)),
             "ble_signals": ble_signals,
             "latest_reading": p.get("latest_reading"),
             "recommendation": rec,
         }
 
-    directory = {
-        mid_id: m["url"] for mid_id, m in mids_out.items() if m.get("url")
-    }
+    directory = {mid_id: m["url"] for mid_id, m in mids_out.items() if m.get("url")}
 
     return {
         "top_id": TOP_ID,
         "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "cooldown_config": {
-            "rounds": MOVE_COOLDOWN_ROUNDS,
-            "seconds": int(MOVE_COOLDOWN_S),
-        },
+        "cooldown_config": {"rounds": MOVE_COOLDOWN_ROUNDS},
         "recording_now": recording_now,
         "directory": directory,
         "middle_nodes": mids_out,
@@ -483,15 +493,25 @@ function fmtAdapt(r, priMap, modId) {
   const z = Array.isArray(r.norm_vec) ? '[' + r.norm_vec.map(v => Number(v).toFixed(2)).join(', ') + ']' : '-';
   return `<div>Score: ${sc} | Pri: ${pri}</div><div class="muted">Z: ${z}</div>`;
 }
+function tickRecordingTimers() {
+  const nowMs = Date.now();
+  document.querySelectorAll('.b-rec[data-rec-base]').forEach(el => {
+    const base = Number(el.getAttribute('data-rec-base') || 0);
+    const fetched = Number(el.getAttribute('data-rec-fetched') || nowMs);
+    const sec = Math.max(0, Math.floor(base + (nowMs - fetched) / 1000));
+    el.textContent = `Recording (${sec}s)`;
+  });
+}
 async function refresh() {
   const res = await fetch('/api/state');
   const data = await res.json();
+  const fetchedAtMs = Date.now();
   const mids = Object.values(data.middle_nodes || {});
   const mods = Object.values(data.participants || {});
-  const cd = data.cooldown_config || {rounds: 3, seconds: 1800};
+  const cd = data.cooldown_config || {rounds: 3};
 
   document.getElementById('subline').textContent =
-    `Timer checks closest room every 15s in AUTO (BLE) mode (locked during recording). Post-move cooldown: ${cd.rounds} rounds or ${Math.round(cd.seconds/60)} min.`;
+    `Timer checks closest room every 15s in AUTO (BLE) mode (locked during recording). Post-move cooldown: ${cd.rounds} rounds.`;
 
   const pills = mids.map(m =>
     `<span class="pill">${m.middle_id}: ${m.ip} (${m.active_bottom_count} active)</span>`
@@ -506,8 +526,9 @@ async function refresh() {
     const assigned = p.assigned_room || 'UNASSIGNED';
     const midCtx = (data.middle_nodes[assigned] || {}).context_analysis || {};
     const priMap = midCtx.priority_weights || {};
+    const baseSec = Number(p.recording_elapsed_s || 0);
     const statusBadge = p.is_recording
-      ? `<span class="badge b-rec">Recording (${Math.round(p.recording_elapsed_s)}s)</span>`
+      ? `<span class="badge b-rec" data-rec-base="${baseSec}" data-rec-fetched="${fetchedAtMs}">Recording (${Math.floor(baseSec)}s)</span>`
       : `<span class="badge b-online">${p.online ? 'Online (Idle)' : 'Offline'}</span>`;
 
     const rec = p.recommendation || {};
@@ -569,7 +590,8 @@ async function refresh() {
   document.getElementById('room-cards').innerHTML = cardsHtml;
 }
 refresh();
-setInterval(refresh, 2500);
+setInterval(refresh, 2000);
+setInterval(tickRecordingTimers, 1000);
 </script>
 </body>
 </html>
@@ -708,9 +730,19 @@ class TopHandler(BaseHTTPRequestHandler):
                     p = ensure_participant_locked(mod_id)
                     p["ip"] = b_info.get("ip", p["ip"])
                     p["last_seen"] = now
-                    p["is_recording"] = bool(b_info.get("is_recording", False))
-                    p["recording_elapsed_s"] = float(b_info.get("recording_elapsed_s", 0.0))
                     p["sim_mode"] = bool(b_info.get("sim_mode", False))
+
+                    prev_rec = bool(p.get("is_recording", False))
+                    new_rec = bool(b_info.get("is_recording", False))
+                    rep_elapsed = float(b_info.get("recording_elapsed_s", 0.0))
+                    p["is_recording"] = new_rec
+                    if new_rec:
+                        if not prev_rec or p.get("recording_started_at") is None or rep_elapsed > 0:
+                            p["recording_started_at"] = now - rep_elapsed
+                        p["recording_elapsed_s"] = max(rep_elapsed, now - float(p["recording_started_at"]))
+                    else:
+                        p["recording_started_at"] = None
+                        p["recording_elapsed_s"] = 0.0
 
                     if p["assigned_room"] == "UNASSIGNED":
                         assign_room_locked(mod_id, mid_id, source="initial-attach")
@@ -718,9 +750,7 @@ class TopHandler(BaseHTTPRequestHandler):
                     latest_r = b_info.get("latest_reading")
                     if isinstance(latest_r, dict):
                         p["latest_reading"] = latest_r
-                        r_ts = str(latest_r.get("timestamp") or payload.get("timestamp") or "")
-                        if event_type == "reading" or (trigger_mod == mod_id and r_ts):
-                            move_cooldown.record_capture_round(mod_id, r_ts)
+                        move_cooldown.record_capture_round(mod_id, latest_r)
 
                 if event_type == "reading" and trigger_mod:
                     rec = compute_recommendation_locked(trigger_mod)
@@ -795,6 +825,7 @@ class TopHandler(BaseHTTPRequestHandler):
                 for p in participants.values():
                     p["latest_reading"] = None
                     p["is_recording"] = False
+                    p["recording_started_at"] = None
                     p["recording_elapsed_s"] = 0.0
                 move_cooldown.clear()
             for url in mid_urls:
@@ -813,7 +844,7 @@ def main():
     server = ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), TopHandler)
     print(
         f"[{TOP_ID}] Top Cluster Coordinator listening on 0.0.0.0:{LISTEN_PORT} "
-        f"(Move cooldown: {MOVE_COOLDOWN_ROUNDS} rounds or {int(MOVE_COOLDOWN_S // 60)} min)"
+        f"(Move cooldown: {MOVE_COOLDOWN_ROUNDS} rounds)"
     )
     try:
         server.serve_forever()
