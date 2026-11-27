@@ -2,8 +2,7 @@
 # Bottom-Layer Vital-Sign Sensor Node (0~10 per Middle Pi)
 # Connects: Webcam + micro:bit (GSR, BPM, Temp) -> Computes personal baseline Z-scores & adaptability
 # -> Streams 2-min summary, live recording status, & metrics to assigned Middle Pi.
-# Broadcasts persistent BLE beacon (MODULE_ID) for proximity routing & resolves room from Top Pi.
-# Sends post-session room movement recommendations (MOVE:<cur>:<sug>) back to the micro:bit LED.
+# Locks room assignment during active 2-minute captures and pushes post-session move cues to micro:bit LED.
 
 from __future__ import annotations
 
@@ -338,6 +337,15 @@ def get_json(url: str, timeout: float = 3.0) -> dict | None:
 
 def sync_dynamic_route(force_led: bool = False):
     global current_mid_id, current_middle_url
+    rec_active, _, _ = get_capture_state()
+    with route_lock:
+        locked_url = current_middle_url
+
+    # Freeze room assignment for the entire duration of an active recording
+    if rec_active and locked_url:
+        update_microbit_recommendation_led(None, force_send=force_led)
+        return
+
     top_url = get_top_url()
     if not top_url:
         cached = get_cached_middle_url()
@@ -879,7 +887,7 @@ def run_capture_loop(read_line_fn, sim_mode: bool):
                 resp_thread.start()
                 mode_tag = " [SIM]" if sim_mode else ""
                 mid_id, _ = get_active_route()
-                print(f"[{ts}] START{mode_tag} (Room: {mid_id}) -> Recording 2 min...")
+                print(f"[{ts}] START{mode_tag} (Room: {mid_id} LOCKED) -> Recording 2 min...")
 
             elif line == "#STOP":
                 if writer is None:
@@ -896,7 +904,7 @@ def run_capture_loop(read_line_fn, sim_mode: bool):
                     resp_stop_event.set()
                     resp_thread.join(timeout=5.0)
 
-                print("STOP received.")
+                print("STOP received (room unlocked).")
                 finalize_session(rows, resp_result, wall_duration_s)
 
             elif writer is not None:

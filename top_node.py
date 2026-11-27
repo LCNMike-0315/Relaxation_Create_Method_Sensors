@@ -191,6 +191,16 @@ def prune_stale_middles_locked(now: float):
         print(f"[{TOP_ID}] Middle Pi offline (timeout > {MIDDLE_STALE_S:.0f}s): {mid}")
 
 
+def is_module_recording_locked(mod_id: str) -> bool:
+    for info in middle_states.values():
+        pkt = info.get("packet") or {}
+        b_nodes = pkt.get("bottom_nodes") or {}
+        b_info = b_nodes.get(mod_id)
+        if isinstance(b_info, dict) and b_info.get("is_recording"):
+            return True
+    return False
+
+
 def default_middle_id_locked() -> str:
     if "MID-01" in middle_states:
         return "MID-01"
@@ -234,6 +244,7 @@ def resolve_route_locked(mod_id: str) -> dict:
         "mid_id": target_mid,
         "middle_url": middle_url,
         "mode": mode,
+        "locked": is_module_recording_locked(mod_id),
         "move_recommendation": active_rec,
     }
 
@@ -244,6 +255,10 @@ def evaluate_ble_routing_locked(
     force_recheck: bool = False,
     source_tag: str = "BLE",
 ):
+    # Do not switch rooms while the participant is recording
+    if is_module_recording_locked(mod_id):
+        return
+
     current = room_assignments.get(mod_id, {})
     if current.get("mode") == "manual":
         return
@@ -791,6 +806,7 @@ def render_rooms_html() -> str:
     h2 { font-size: 16px; margin: 24px 0 10px 0; color: #e5e7eb; }
     p.sub { color: #9ca3af; font-size: 13px; margin-top: 0; }
     button, a.btn { background: #2563eb; color: #fff; border: none; padding: 6px 10px; border-radius: 6px; cursor: pointer; margin-right: 6px; font-size: 12px; text-decoration: none; display: inline-block; }
+    button:disabled { opacity: 0.38; cursor: not-allowed; }
     button.auto { background: #059669; }
     button.check { background: #7c3aed; margin-left: 8px; }
     a.export-btn { background: #0d9488; font-weight: 600; margin-left: 4px; }
@@ -806,6 +822,7 @@ def render_rooms_html() -> str:
     .badge-warn { background: #991b1b; color: #fecaca; font-weight: 700; }
     .badge-rec { background: #b91c1c; color: #fef2f2; font-weight: 700; animation: pulseRec 1.4s infinite; }
     .badge-idle { background: #1e3a8a; color: #bfdbfe; }
+    .badge-lock { background: #78350f; color: #fde68a; font-weight: 600; }
     .badge-heat { background: #9a3412; color: #fed7aa; font-weight: 600; }
     .badge-cold { background: #075985; color: #bae6fd; font-weight: 600; }
     .badge-stress { background: #7f1d1d; color: #fecaca; font-weight: 600; }
@@ -826,7 +843,7 @@ def render_rooms_html() -> str:
 <body>
   <h1>Dynamic Room Router & Context Control</h1>
   <p class="sub">
-    Timer automatically checks closest room every <span id="interval">15</span>s when in <b>AUTO (BLE)</b> mode.
+    Timer automatically checks closest room every <span id="interval">15</span>s when in <b>AUTO (BLE)</b> mode (locked during recording).
     <button class="check" onclick="recheckAll()">Check Closest Now</button>
     <a class="btn export-btn" href="/api/export.zip">Download All Experiment Data (.ZIP)</a>
     <button class="reset-btn" onclick="initializeAllData()">Initialize (Clear All Data)</button>
@@ -858,11 +875,15 @@ def render_rooms_html() -> str:
     let latestFetchMs = 0;
 
     async function assign(modId, midId, mode) {
-      await fetch('/api/assign', {
+      const res = await fetch('/api/assign', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({mod_id: modId, mid_id: midId, mode: mode})
       });
+      const out = await res.json();
+      if (!out.ok) {
+        alert(out.error || "Cannot switch room right now.");
+      }
       refresh();
     }
     async function recheckAll() {
@@ -968,6 +989,7 @@ def render_rooms_html() -> str:
       tbody.innerHTML = Array.from(mods).sort().map(mod => {
         const cur = (data.room_assignments || {})[mod] || {mid_id: 'MID-01', mode: 'auto'};
         const st = nodeStateByMod[mod];
+        const isLocked = Boolean(st && st.is_recording);
 
         let captureBadge = '<span class="badge">Offline</span>';
         if (st) {
@@ -978,6 +1000,10 @@ def render_rooms_html() -> str:
             captureBadge = '<span class="badge badge-idle">Online (Idle)</span>';
           }
         }
+
+        const modeHtml = isLocked
+          ? `<span class="badge">${cur.mode}</span><span class="badge badge-lock">LOCKED</span>`
+          : `<span class="badge">${cur.mode}</span>`;
 
         const rssiMap = (data.ble_rssi || {})[mod] || {};
         const rssiKeys = Object.keys(rssiMap).sort();
@@ -1026,24 +1052,25 @@ def render_rooms_html() -> str:
           statText = `<div class="mono">Score: ${sc} | Pri: ${pr}</div><div class="mono" style="color:#9ca3af;">Z: ${nv}</div>`;
         }
 
+        const disAttr = isLocked ? 'disabled title="Room locked while recording"' : '';
         const rec = recs[mod];
         let recHtml = '<span class="badge badge-ok">Steady (No move)</span>';
         if (rec) {
           recHtml = `<div style="color:#fbbf24;font-weight:600;">Move → ${rec.to_mid}</div>`
             + `<div style="font-size:11px;color:#d1d5db;">${rec.reason}</div>`
-            + `<button class="move-btn" onclick="assign('${mod}','${rec.to_mid}','manual')">Apply Move</button>`;
+            + `<button class="move-btn" ${disAttr} onclick="assign('${mod}','${rec.to_mid}','manual')">Apply Move</button>`;
         }
 
         const btns = mids.map(m => {
           const cls = (cur.mid_id === m && cur.mode === 'manual') ? 'active' : '';
-          return `<button class="${cls}" onclick="assign('${mod}','${m}','manual')">${m}</button>`;
-        }).join('') + `<button class="auto ${cur.mode === 'auto' ? 'active' : ''}" onclick="assign('${mod}','${cur.mid_id}','auto')">AUTO (BLE)</button>`;
+          return `<button class="${cls}" ${disAttr} onclick="assign('${mod}','${m}','manual')">${m}</button>`;
+        }).join('') + `<button class="auto ${cur.mode === 'auto' ? 'active' : ''}" ${disAttr} onclick="assign('${mod}','${cur.mid_id}','auto')">AUTO (BLE)</button>`;
 
         return `<tr>
           <td><b>${mod}</b></td>
           <td>${captureBadge}</td>
           <td>${cur.mid_id}</td>
-          <td><span class="badge">${cur.mode}</span></td>
+          <td>${modeHtml}</td>
           <td class="rssi">${rssiText}</td>
           <td>${vitalsHtml}</td>
           <td>${statText}</td>
@@ -1190,12 +1217,22 @@ class TopHandler(BaseHTTPRequestHandler):
             mid_id = str(payload.get("mid_id", "")).strip().upper()
             mode = str(payload.get("mode", "manual")).strip().lower()
             if not mod_id or not mid_id:
-                self._send_json(400, {"error": "Provide mod_id and mid_id"})
+                self._send_json(400, {"ok": False, "error": "Provide mod_id and mid_id"})
                 return
             if mode not in ("manual", "auto"):
                 mode = "manual"
 
             with state_lock:
+                if is_module_recording_locked(mod_id):
+                    self._send_json(
+                        409,
+                        {
+                            "ok": False,
+                            "error": f"Room is locked while {mod_id} is recording. Wait until capture finishes.",
+                        },
+                    )
+                    return
+
                 prev_mid = (room_assignments.get(mod_id) or {}).get("mid_id", "")
                 room_assignments[mod_id] = {
                     "mid_id": mid_id,
