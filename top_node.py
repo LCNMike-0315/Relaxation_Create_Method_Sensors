@@ -96,6 +96,7 @@ state_lock = threading.Lock()
 middle_states: dict[str, dict] = {}
 room_assignments: dict[str, dict] = {}
 ble_observations: dict[str, dict[str, dict]] = {}
+latest_move_recommendations: dict[str, dict] = {}
 prev_recording_state: dict[str, bool] = {}
 last_room_signature: dict[str, str] = {}
 last_logged_recommendations: dict[str, tuple[str, str]] = {}
@@ -219,12 +220,21 @@ def resolve_route_locked(mod_id: str) -> dict:
     m_info = middle_states.get(target_mid)
     middle_url = f"http://{m_info['ip']}:{m_info.get('port', 8001)}" if m_info else ""
 
+    rec = latest_move_recommendations.get(mod_id)
+    active_rec = None
+    if isinstance(rec, dict):
+        if rec.get("from_mid") == target_mid and rec.get("to_mid") and rec.get("to_mid") != target_mid:
+            active_rec = rec
+        else:
+            latest_move_recommendations.pop(mod_id, None)
+
     return {
         "ok": True,
         "mod_id": mod_id,
         "mid_id": target_mid,
         "middle_url": middle_url,
         "mode": mode,
+        "move_recommendation": active_rec,
     }
 
 
@@ -254,6 +264,8 @@ def evaluate_ble_routing_locked(
                 "mode": "auto",
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
             }
+            if prev_mid != default_mid:
+                latest_move_recommendations.pop(mod_id, None)
             save_assignments_locked()
             log_routing_event_locked("ROOM_ASSIGN", mod_id, prev_mid, default_mid, "auto", source_tag, now, "No BLE signal yet")
             print(f"[{TOP_ID}] ROOM ASSIGN ({source_tag} - no BLE signal yet): {mod_id} -> {default_mid}")
@@ -271,6 +283,8 @@ def evaluate_ble_routing_locked(
                 "rssi": best_rssi,
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
             }
+            if cur_mid != best_mid:
+                latest_move_recommendations.pop(mod_id, None)
             save_assignments_locked()
             log_routing_event_locked("ROOM_ASSIGN", mod_id, cur_mid or "", best_mid, "auto", source_tag, now, rssi_summary)
             print(f"[{TOP_ID}] ROOM ASSIGN ({source_tag}): {mod_id} -> {best_mid} [{rssi_summary}]")
@@ -284,6 +298,7 @@ def evaluate_ble_routing_locked(
             "rssi": best_rssi,
             "updated_at": datetime.now().isoformat(timespec="seconds"),
         }
+        latest_move_recommendations.pop(mod_id, None)
         save_assignments_locked()
         log_routing_event_locked("ROOM_SWITCH", mod_id, cur_mid, best_mid, "auto", source_tag, now, rssi_summary)
         print(
@@ -479,6 +494,8 @@ def build_global_snapshot_locked() -> dict:
         }
 
     move_recommendations = compute_move_recommendations_locked(middles_out)
+    latest_move_recommendations.clear()
+    latest_move_recommendations.update(move_recommendations)
 
     ble_live = {}
     for mod_id, per_mid in sorted(ble_observations.items()):
@@ -543,6 +560,7 @@ def reset_all_cluster_data() -> dict:
         prev_recording_state.clear()
         last_room_signature.clear()
         last_logged_recommendations.clear()
+        latest_move_recommendations.clear()
 
         for info in middle_states.values():
             pkt = info.get("packet")
@@ -1184,6 +1202,8 @@ class TopHandler(BaseHTTPRequestHandler):
                     "mode": mode,
                     "updated_at": datetime.now().isoformat(timespec="seconds"),
                 }
+                if prev_mid != mid_id:
+                    latest_move_recommendations.pop(mod_id, None)
                 if mode == "auto":
                     evaluate_ble_routing_locked(mod_id, now, force_recheck=True, source_tag="AUTO-BTN")
                 else:

@@ -3,7 +3,7 @@
 # Connects: Webcam + micro:bit (GSR, BPM, Temp) -> Computes personal baseline Z-scores & adaptability
 # -> Streams 2-min summary, live recording status, & metrics to assigned Middle Pi.
 # Broadcasts persistent BLE beacon (MODULE_ID) for proximity routing & resolves room from Top Pi.
-# Automatically switches to simulated sensors if no micro:bit is connected (or with --sim).
+# Sends post-session room movement recommendations (MOVE:<cur>:<sug>) back to the micro:bit LED.
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import json
 import math
 import os
 import random
+import re
 import shutil
 import socket
 import subprocess
@@ -73,6 +74,56 @@ is_recording: bool = False
 capture_start_wall: float = 0.0
 is_sim_mode: bool = False
 
+serial_lock = threading.Lock()
+active_serial: serial.Serial | None = None
+last_led_cmd: str = ""
+
+
+def extract_room_num(mid_id: str) -> str:
+    m = re.search(r"(\d+)$", str(mid_id or "").strip())
+    return str(int(m.group(1))) if m else ""
+
+
+def send_microbit_led_cmd(cmd: str, force: bool = False):
+    global last_led_cmd
+    with serial_lock:
+        if not force and cmd == last_led_cmd:
+            return
+        last_led_cmd = cmd
+        ser = active_serial
+        if ser is not None and ser.is_open:
+            try:
+                ser.write((cmd + "\n").encode("utf-8"))
+                ser.flush()
+            except Exception as exc:
+                print(f"[{MODULE_ID}] Warning: failed writing '{cmd}' to micro:bit ({exc})")
+
+
+def update_microbit_recommendation_led(move_rec: dict | None, force_send: bool = False):
+    rec_active, _, _ = get_capture_state()
+    with metrics_lock:
+        has_completed_session = latest_payload_cache is not None
+    with route_lock:
+        cur_mid = current_mid_id
+
+    if rec_active or not has_completed_session or not isinstance(move_rec, dict):
+        send_microbit_led_cmd("CLEAR", force=force_send)
+        return
+
+    from_mid = str(move_rec.get("from_mid") or cur_mid).strip().upper()
+    to_mid = str(move_rec.get("to_mid") or "").strip().upper()
+    cur_num = extract_room_num(from_mid)
+    sug_num = extract_room_num(to_mid)
+
+    if cur_num and sug_num and cur_num != sug_num:
+        cmd = f"MOVE:{cur_num}:{sug_num}"
+        changed = (cmd != last_led_cmd)
+        send_microbit_led_cmd(cmd, force=force_send)
+        if changed or force_send:
+            print(f"[{MODULE_ID}] micro:bit LED -> Room {cur_num} -> ・ -> Room {sug_num}")
+    else:
+        send_microbit_led_cmd("CLEAR", force=force_send)
+
 
 def set_capture_state(recording: bool, sim_mode: bool | None = None):
     global is_recording, capture_start_wall, is_sim_mode
@@ -95,6 +146,7 @@ def reset_local_data():
     with metrics_lock:
         history_buffer.clear()
         latest_payload_cache = None
+    send_microbit_led_cmd("CLEAR", force=True)
     if OUT_DIR.exists():
         for item in OUT_DIR.iterdir():
             try:
@@ -284,13 +336,14 @@ def get_json(url: str, timeout: float = 3.0) -> dict | None:
     return None
 
 
-def sync_dynamic_route():
+def sync_dynamic_route(force_led: bool = False):
     global current_mid_id, current_middle_url
     top_url = get_top_url()
     if not top_url:
         cached = get_cached_middle_url()
         with route_lock:
             current_middle_url = cached
+        update_microbit_recommendation_led(None, force_send=force_led)
         return
 
     q = urllib.parse.urlencode({"mod_id": MODULE_ID})
@@ -301,6 +354,7 @@ def sync_dynamic_route():
     new_mid = str(res.get("mid_id", "UNKNOWN")).strip().upper()
     new_url = str(res["middle_url"]).strip().rstrip("/")
     mode = res.get("mode", "auto")
+    move_rec = res.get("move_recommendation")
 
     old_url = ""
     old_mid = ""
@@ -326,6 +380,8 @@ def sync_dynamic_route():
             print(f"\n[{MODULE_ID}] ROOM SWITCH ({mode_label}): {old_mid} -> {new_mid} ({new_url})\n")
         else:
             print(f"[{MODULE_ID}] Assigned Room ({mode_label}): {new_mid} ({new_url})")
+
+    update_microbit_recommendation_led(move_rec, force_send=force_led)
 
 
 def start_ble_beacon():
@@ -672,7 +728,7 @@ def finalize_session(rows: list[tuple], resp_result: dict, wall_duration_s: floa
     global latest_payload_cache
     if not rows:
         print("  [!] No data rows recorded.")
-        sync_dynamic_route()
+        sync_dynamic_route(force_led=True)
         return
 
     gsr_list = [r[0] for r in rows]
@@ -758,7 +814,8 @@ def finalize_session(rows: list[tuple], resp_result: dict, wall_duration_s: floa
             "1" if sent_ok else "0",
         ])
 
-    sync_dynamic_route()
+    # Immediately fetch Top Pi's updated movement recommendation and push to micro:bit LED
+    sync_dynamic_route(force_led=True)
 
 
 def run_capture_loop(read_line_fn, sim_mode: bool, hb_stop: threading.Event):
@@ -770,6 +827,7 @@ def run_capture_loop(read_line_fn, sim_mode: bool, hb_stop: threading.Event):
     resp_result = {}
 
     set_capture_state(False, sim_mode=sim_mode)
+    send_microbit_led_cmd("CLEAR", force=True)
 
     try:
         while True:
@@ -791,6 +849,7 @@ def run_capture_loop(read_line_fn, sim_mode: bool, hb_stop: threading.Event):
                 session_start_wall = time.time()
 
                 set_capture_state(True, sim_mode=sim_mode)
+                send_microbit_led_cmd("CLEAR", force=True)
                 trigger_immediate_heartbeat()
 
                 resp_result = {"resp_rate": 0}
@@ -850,6 +909,7 @@ def run_capture_loop(read_line_fn, sim_mode: bool, hb_stop: threading.Event):
             resp_stop_event.set()
     finally:
         set_capture_state(False, sim_mode=sim_mode)
+        send_microbit_led_cmd("CLEAR", force=True)
         hb_stop.set()
         stop_ble_beacon()
         if f:
@@ -857,6 +917,7 @@ def run_capture_loop(read_line_fn, sim_mode: bool, hb_stop: threading.Event):
 
 
 def main():
+    global active_serial
     force_sim = "--sim" in sys.argv
     cli_args = [a for a in sys.argv[1:] if a != "--sim"]
     port = None if force_sim else (cli_args[0] if cli_args else find_port())
@@ -877,11 +938,17 @@ def main():
         print("Press Button A on the micro:bit to start a 2-minute capture...")
         with serial.Serial(port, BAUD, timeout=1) as ser:
             ser.reset_input_buffer()
-            run_capture_loop(
-                lambda: ser.readline().decode("utf-8", errors="ignore").strip(),
-                sim_mode=False,
-                hb_stop=hb_stop,
-            )
+            with serial_lock:
+                active_serial = ser
+            try:
+                run_capture_loop(
+                    lambda: ser.readline().decode("utf-8", errors="ignore").strip(),
+                    sim_mode=False,
+                    hb_stop=hb_stop,
+                )
+            finally:
+                with serial_lock:
+                    active_serial = None
     else:
         sim = SimulatedMicrobit()
         start_control_http_server(SIM_CONTROL_PORT, sim_ref=sim)
